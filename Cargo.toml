@@ -1,5 +1,5 @@
 [package]
-name = "crypto_bot"
+name = "oboobot"
 version = "0.1.0"
 edition = "2021"
 
