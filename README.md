@@ -5,6 +5,28 @@ This README is honest about scope. Everything described as "implemented"
 below actually compiles and is tested. Everything described as "deferred"
 is deferred on purpose, with the reason stated.
 
+Before I continue:
+
+> [!CAUTION]
+> **RISK WARNING**
+>
+> Trading foreign exchange, futures, CFDs, cryptocurrencies, and other leveraged products carries a high level of risk and may not be suitable for all investors. You could sustain a loss of some or all of your invested capital. You should not invest money you cannot afford to lose. Before trading, carefully consider your financial objectives, level of experience, and risk appetite. Seek independent financial advice if necessary.
+
+> [!WARNING]
+> **EDUCATIONAL DISCLAIMER**
+>
+> The content provided is for informational and educational purposes only and does not constitute financial, investment, or legal advice. No representation is being made that any information provided is accurate, complete, or up to date. Trading ideas, setups, and strategies are hypothetical and should not be considered as trade recommendations or solicitation to buy or sell any financial instrument.
+
+> [!NOTE]
+> **HYPOTHETICAL / SIMULATED RESULTS DISCLAIMER**
+>
+> Hypothetical or simulated performance results have certain inherent limitations. Unlike actual trading records, simulated results do not represent real trading. No representation is being made that any account will or is likely to achieve profits or losses similar to those discussed. Past performance is not indicative of future results.
+
+
+
+Now that that is said and done:
+
+
 ## Layout
 
 A real Cargo workspace, not one crate with folders, specifically so the
