@@ -1,3 +1,5 @@
+![bruh's Signature Image](docs/images/oboobot.jpg)
+
 A Rust, trait-based, event-driven trading daemon implementing an SMT
 (Smart Money Technique) divergence strategy gated by True Open levels.
 
