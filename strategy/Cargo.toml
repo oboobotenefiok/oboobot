@@ -1,0 +1,14 @@
+[package]
+name = "strategy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain = { path = "../domain" }
+session_time = { path = "../session_time" }
+rust_decimal = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }

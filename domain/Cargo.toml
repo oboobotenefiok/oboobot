@@ -1,0 +1,25 @@
+[package]
+name = "domain"
+version = "0.1.0"
+edition = "2021"
+
+# This crate is the bottom of the dependency stack on purpose. It defines
+# what a Position, an Order, a Percent, an Event look like, and nothing
+# else, no broker calls, no file I/O, no scheduling. Every other crate in
+# the workspace depends on this one; this one depends on nothing in the
+# workspace. That's not a style preference, it's the enforcement mechanism
+# for the "no cyclic dependencies, only through traits" rule: if a broker
+# adapter ever tries to import something from `strategy`, Cargo simply
+# won't build it, because it's not a listed dependency here or anywhere
+# upstream of here.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rust_decimal_macros = { workspace = true }

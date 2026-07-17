@@ -1,0 +1,18 @@
+[package]
+name = "session_time"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+domain = { path = "../domain" }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rust_decimal_macros = { workspace = true }

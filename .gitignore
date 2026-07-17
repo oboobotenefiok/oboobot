@@ -1,2 +1,8 @@
 /target
-.env
+**/*.rs.bk
+*.pdb
+
+# The demo binary writes its cursor file under the OS temp directory, not
+# here, but excluding a local state/ directory too in case a future real
+# deployment config points it at one relative to the project root.
+/state

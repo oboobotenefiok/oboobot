@@ -1,9 +1,53 @@
-[package]
-name = "oboobot"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "domain",
+    "session_time",
+    "broker",
+    "strategy",
+    "risk",
+    "persistence",
+    "daemon",
+]
 
-[dependencies]
-dotenvy = "0.15"
+# Every crate in this workspace pulls its third-party dependencies from here.
+# The point of doing it this way (instead of letting each crate pick its own
+# version) is that we only ever have one copy of, say, rust_decimal in the
+# dependency tree. That matters more than usual for us because a lot of our
+# domain types (Percent, Usd, Decimal) cross crate boundaries constantly, and
+# two slightly different semver-compatible-but-not-identical versions of the
+# same crate can quietly become two different, incompatible types.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "=1.10.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+rust_decimal = { version = "=1.30.0", default-features = false, features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+arc-swap = "1"
+# Pinned rather than left at the latest "1.x": proptest 1.11 depends on
+# rand 0.9, which pulls in a getrandom release that requires Cargo's
+# edition2024 feature, not supported by the Rust 1.75 toolchain this
+# workspace builds with (installed via apt; see the workspace-level note
+# on why apt rather than rustup). proptest 1.4.0 depends on rand 0.8
+# instead, which sidesteps that whole chain.
+proptest = "=1.4.0"
+# Same situation, different package: newer tempfile releases pull in a
+# getrandom version with the same edition2024 requirement. 3.14.0 predates
+# that.
+tempfile = "=3.14.0"
+
+[profile.dev]
+# Debug assertions catch integer overflow and similar arithmetic mistakes at
+# runtime instead of silently wrapping. For a trading daemon, an arithmetic
+# bug that silently wraps instead of panicking is much scarier than a panic
+# would be, so we want these on even outside of `cargo test`.
+overflow-checks = true
