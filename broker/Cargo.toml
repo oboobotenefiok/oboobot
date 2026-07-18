@@ -13,6 +13,10 @@ parking_lot = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+tracing = { workspace = true }
+tokio-tungstenite = { version = "=0.20.1", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

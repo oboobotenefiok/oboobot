@@ -1,0 +1,87 @@
+name: Trading cycle
+
+on:
+  schedule:
+    # Every 5 minutes. This is deliberately much more frequent than the
+    # strategy's 8 real macro cycles a day: GitHub does not guarantee
+    # scheduled workflows fire exactly on time (it says so explicitly,
+    # and delays get worse for anything scheduled more often than
+    # hourly), so instead of trusting cron to land inside our 20-minute
+    # windows, the binary itself checks whether it's currently inside
+    # one and exits immediately if not. As long as some run lands in
+    # each window, which a 5-minute cadence makes very likely, the exact
+    # trigger time stops mattering. Most invocations do nothing but that
+    # check and exit in a few seconds.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run a cycle even if outside a macro cycle window'
+        type: boolean
+        default: false
+
+# Prevents two invocations from ever running at once. Belt and suspenders
+# with the state repo's git push below: even if this were somehow
+# bypassed, a second concurrent push would just be rejected by git
+# rather than silently racing, but this way it never gets that far.
+concurrency:
+  group: oboobot-trading-cycle
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout oboobot
+        uses: actions/checkout@v4
+        with:
+          path: oboobot
+
+      - name: Checkout oboobot_report (state)
+        uses: actions/checkout@v4
+        with:
+          repository: oboobotenefiok/oboobot_report
+          # The default GITHUB_TOKEN is scoped to this repo only; a
+          # separate repo needs a real PAT with write access to
+          # oboobot_report, stored as this secret.
+          token: ${{ secrets.STATE_REPO_TOKEN }}
+          path: oboobot_report
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oboobot
+
+      - name: Run one cycle
+        working-directory: oboobot
+        env:
+          DERIV_APP_ID: ${{ secrets.DERIV_APP_ID }}
+          DERIV_API_TOKEN: ${{ secrets.DERIV_API_TOKEN }}
+          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+          # --broker mock until a real adapter is wired in: see the
+          # workspace README for status. Swap this to --broker deriv
+          # (or bybit) once one is ready to trade for real.
+          cargo run --release --bin oboobot -- \
+            --broker mock \
+            --state-dir ../oboobot_report/state \
+            $FORCE_FLAG
+
+      - name: Commit and push state changes
+        working-directory: oboobot_report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "no state changes this run"
+          else
+            git commit -m "state update: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi

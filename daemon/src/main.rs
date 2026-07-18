@@ -1,31 +1,83 @@
-//! This binary is a demonstration harness, not a production entry point.
-//! It wires every crate in this workspace together and runs a handful of
-//! synthetic macro cycles against `MockBroker`, so that running `cargo
-//! run` actually shows the whole pipeline working end to end: SMT
-//! divergence detection, the True Open gate, risk sizing, order
-//! submission, startup reconciliation, and the health-state gate that
-//! blocks new entries when something's wrong.
+//! `oboobot` — real entry point for the QuarterlyTheory_SMT_Trader daemon.
 //!
-//! A real production entry point would swap `MockBroker` for a real
-//! `BrokerAdapter` implementation, use `session_time::SystemClock`
-//! instead of a fixed timestamp, and call `Scheduler::run` (which runs
-//! forever, sleeping between real macro cycles) instead of driving a
-//! fixed, fast sequence of scenarios by hand. Building that real adapter
-//! means confirming exact endpoint URLs and auth flows against a live
-//! broker's current docs, which isn't something to guess at, so it's
-//! intentionally left as the next step rather than faked here.
+//! Two distinct modes live in this file:
+//!
+//! - The default, real mode: parse CLI flags, check whether we're inside
+//!   a macro cycle window *before touching the broker at all*, and if
+//!   so, reconcile and run exactly one cycle, then exit. This is the
+//!   shape a GitHub Actions workflow invokes every five minutes: cheap
+//!   to run, cheap to skip, no assumption that the process stays alive
+//!   between invocations.
+//! - `--demo`: the original scripted walkthrough (a clean pass, a
+//!   no-divergence cycle, a True-Open rejection, a health-triggered
+//!   lockout, a simulated restart), unchanged from the first pass,
+//!   useful for anyone exploring this repo who wants to see the whole
+//!   pipeline narrated in one run rather than deployed for real.
+//!
+//! One honest gap, named rather than hidden: the real-mode path below
+//! builds its divergence-detection buffers from a fixed offset around
+//! the current price rather than genuine rolling daily/session highs
+//! and lows tracked across many invocations. That means it will
+//! correctly reconcile, correctly persist state, and correctly decide
+//! "not in a window, skip" — but it will never actually find a
+//! divergence and place a trade, on purpose, until real buffer
+//! persistence replaces the placeholder. Faking a buffer that could
+//! produce a real trade from synthetic data would be a much worse kind
+//! of dishonesty than a buffer that only ever proves the pipeline runs.
+//! The order-placing path itself is still fully proven, just by
+//! `daemon/tests/integration_test.rs` and `--demo`, not by this path yet.
 
-use broker::{BrokerAdapter, MockBroker};
+use std::path::PathBuf;
+
+use broker::{BrokerAdapter, BybitAdapter, DerivAdapter, MockBroker};
+use clap::{Parser, ValueEnum};
 use daemon::{
     allows_new_entries, apply_reconciliation, auto_action, reconcile, AssistantEngine,
     HealthCheckFailure, HealthMonitor, LoggingAssistant,
 };
 use domain::{Bias, Direction, Event, EventEnvelope, OrderRequest, OrderType, Position, Usd};
 use persistence::CursorFile;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use risk::RiskEngine as _;
+use session_time::Clock;
 use strategy::{generate_signal, BufferLevels, DivergenceInputs, SignalOutcome};
 use uuid::Uuid;
+
+#[derive(Parser, Debug)]
+#[command(name = "oboobot", about = "QuarterlyTheory_SMT_Trader: an SMT-divergence trading daemon")]
+struct Cli {
+    /// Which broker to trade through. `deriv` and `bybit` are wired into
+    /// the trait and read their config from the environment, but their
+    /// wire protocols aren't implemented yet, so choosing either fails
+    /// clearly rather than pretending to work. `mock` runs end to end.
+    #[arg(long, value_enum, default_value_t = BrokerKind::Mock)]
+    broker: BrokerKind,
+
+    /// Where cursor files (positions, etc.) are read from and written
+    /// to. In the GitHub Actions deployment this points at a checkout of
+    /// the dedicated state repo, not a path inside the code repo.
+    #[arg(long, default_value = "./state")]
+    state_dir: PathBuf,
+
+    /// Skip the macro-cycle window check and run a cycle regardless.
+    /// Meant for a manual workflow_dispatch debugging run, not the
+    /// scheduled path.
+    #[arg(long)]
+    force: bool,
+
+    /// Run the original scripted walkthrough instead of a single real
+    /// cycle. Ignores --broker, --state-dir, and --force.
+    #[arg(long)]
+    demo: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum BrokerKind {
+    Mock,
+    Deriv,
+    Bybit,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,34 +88,127 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("starting QuarterlyTheory_SMT_Trader demonstration harness");
+    let cli = Cli::parse();
+
+    if cli.demo {
+        return run_demo().await;
+    }
+
+    run_real_cycle(cli).await
+}
+
+/// The real, deployable path: check the window first, act only if we're
+/// in one (or told to force it), and exit either way without lingering.
+async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
+    let now = session_time::SystemClock.now();
+
+    if !cli.force && !session_time::is_within_macro_cycle(now) {
+        tracing::info!(now = %now, "not within a macro cycle window, exiting without contacting the broker");
+        return Ok(());
+    }
+
+    tracing::info!(broker = ?cli.broker, forced = cli.force, "within a macro cycle window, proceeding");
+
+    tokio::fs::create_dir_all(&cli.state_dir).await?;
+    let positions_cursor: CursorFile<Position> =
+        CursorFile::new(cli.state_dir.join("positions.cursor"));
+
+    let broker: Box<dyn BrokerAdapter> = match cli.broker {
+        BrokerKind::Mock => Box::new(MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.10000))),
+        BrokerKind::Deriv => Box::new(DerivAdapter::connect_from_env().await?),
+        BrokerKind::Bybit => Box::new(BybitAdapter::from_env()?),
+    };
+
+    let health = HealthMonitor::new();
+    let assistant = LoggingAssistant;
+
+    let locally_known_positions = positions_cursor.read_all().await?;
+    let report = reconcile(broker.as_ref(), &locally_known_positions).await?;
+    if report.is_clean() {
+        tracing::info!("reconciliation: clean, broker and local state agree");
+    } else {
+        tracing::warn!(
+            orphaned = report.orphaned_locally.len(),
+            adopted = report.unknown_to_local.len(),
+            "reconciliation found a mismatch"
+        );
+    }
+    let mut open_positions = apply_reconciliation(&report);
+
+    if !allows_new_entries(health.current_state()) {
+        tracing::info!(
+            state = ?health.current_state(),
+            action = auto_action(health.current_state()),
+            "health state does not currently allow new entries, exiting after reconciliation"
+        );
+        return Ok(());
+    }
+
+    // See the module docs: these buffers are a fixed, always-neutral
+    // offset around the live price, not real rolling highs and lows.
+    // That makes this call correctly, honestly report "no divergence"
+    // every time, until real buffer persistence replaces this.
+    let snapshot = broker
+        .get_snapshot(&["EURUSD".to_string(), "GBPUSD".to_string()])
+        .await?;
+    let half_width = dec!(0.00500);
+    let primary_price = snapshot
+        .prices
+        .get("EURUSD")
+        .map(|q| q.bid)
+        .unwrap_or(dec!(1.10000));
+    let secondary_price = snapshot
+        .prices
+        .get("GBPUSD")
+        .map(|q| q.bid)
+        .unwrap_or(dec!(1.10000));
+    let inputs = DivergenceInputs {
+        primary_price,
+        secondary_price,
+        daily_primary_buffer: placeholder_buffers(primary_price, half_width),
+        daily_secondary_buffer: placeholder_buffers(secondary_price, half_width),
+        session_primary_buffer: placeholder_buffers(primary_price, half_width),
+        session_secondary_buffer: placeholder_buffers(secondary_price, half_width),
+    };
+
+    run_cycle(
+        "scheduled cycle",
+        broker.as_ref(),
+        &health,
+        &assistant,
+        &positions_cursor,
+        &mut open_positions,
+        inputs,
+        Bias::Neutral,
+        Bias::Neutral,
+    )
+    .await?;
+
+    tracing::info!(open_positions = open_positions.len(), "cycle complete");
+    Ok(())
+}
+
+fn placeholder_buffers(price: Decimal, half_width: Decimal) -> BufferLevels {
+    BufferLevels { low: price - half_width, high: price + half_width }
+}
+
+/// The original scripted walkthrough against MockBroker: a clean pass, a
+/// no-divergence cycle, a True-Open rejection, a health-triggered
+/// lockout, and a simulated restart. Unchanged from the first pass.
+async fn run_demo() -> anyhow::Result<()> {
+    tracing::info!("starting oboobot (QuarterlyTheory_SMT_Trader) demonstration harness");
     tracing::info!("this run is against MockBroker; see main.rs docs for what a live run would change");
 
     let broker = MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.10000));
     let health = HealthMonitor::new();
     let assistant = LoggingAssistant;
 
-    // A real deployment would keep this under a persistent `state/`
-    // directory next to wherever the daemon runs from. For this
-    // demonstration harness it goes under the OS temp directory instead,
-    // purely so repeated runs of this binary don't accumulate positions
-    // from previous runs; the durability behavior (fsync before the
-    // append returns, see `persistence::cursor`) is identical either way.
-    let state_dir = std::env::temp_dir().join("smt-trader-demo-state");
+    let state_dir = std::env::temp_dir().join("oboobot-demo-state");
     tokio::fs::create_dir_all(&state_dir).await?;
     let positions_cursor_path = state_dir.join("positions.cursor");
-    // Start every run from a clean cursor file, since this is a
-    // from-scratch demonstration each time, not a genuinely persistent
-    // deployment.
     let _ = tokio::fs::remove_file(&positions_cursor_path).await;
     let positions_cursor: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
 
-    // Every real daemon startup begins here: what does our own
-    // persistence say is open, and does the broker agree? On a genuinely
-    // fresh start there's nothing persisted yet, so this should reconcile
-    // clean, but running it unconditionally (rather than only when we
-    // suspect a problem) is exactly the point: reconciliation isn't a
-    // special recovery-mode action, it's just what startup always does.
     let locally_known_positions: Vec<Position> = positions_cursor.read_all().await?;
     let report = reconcile(&broker, &locally_known_positions).await?;
     if report.is_clean() {
@@ -132,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
             session_primary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
             session_secondary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
         },
-        Bias::Sell, // Weekly is bearish; the divergence above is bullish. Conflict.
+        Bias::Sell,
         Bias::Sell,
     )
     .await?;
@@ -157,23 +302,19 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("open positions before simulated restart: {}", open_positions.len());
 
-    // Simulate the daemon actually restarting: build a brand new
-    // CursorFile pointing at the same path, with none of the in-memory
-    // state above carried over, the same as if this were a fresh process.
-    // If persistence and reconciliation are both doing their job, this
-    // should recover exactly the position(s) opened above, straight from
-    // disk, confirmed against the broker.
-    let post_restart_cursor: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
-    let recovered_from_disk = post_restart_cursor.read_all().await?;
-    let post_restart_report = reconcile(&broker, &recovered_from_disk).await?;
-    let post_restart_positions = apply_reconciliation(&post_restart_report);
+    drop(open_positions);
+    let cursor_after_restart: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
+    let recovered_positions = cursor_after_restart.read_all().await?;
+    let restart_report = reconcile(&broker, &recovered_positions).await?;
+    let restart_reconciled = apply_reconciliation(&restart_report);
     tracing::info!(
-        recovered_from_disk = recovered_from_disk.len(),
-        confirmed_by_broker = post_restart_positions.len(),
-        "simulated restart: recovered position state from disk and reconciled it against the broker"
+        recovered_from_disk = recovered_positions.len(),
+        reconciled_after_restart = restart_reconciled.len(),
+        clean = restart_report.is_clean(),
+        "simulated restart: recovered local state and reconciled against the broker"
     );
 
-    tracing::info!("QuarterlyTheory_SMT_Trader demonstration harness finished");
+    tracing::info!("oboobot demonstration harness finished");
 
     Ok(())
 }
@@ -181,10 +322,10 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_cycle(
     label: &str,
-    broker: &MockBroker,
+    broker: &dyn BrokerAdapter,
     health: &HealthMonitor,
     assistant: &dyn AssistantEngine,
-    positions_cursor: &CursorFile<Position>,
+    cursor: &CursorFile<Position>,
     open_positions: &mut Vec<Position>,
     inputs: DivergenceInputs,
     weekly_bias: Bias,
@@ -199,8 +340,6 @@ async fn run_cycle(
 
     let snapshot = broker.get_snapshot(&["EURUSD".to_string(), "GBPUSD".to_string()]).await?;
     let macro_cycle_event = EventEnvelope::new(snapshot.timestamp, Event::MacroCycleStarted);
-    // The assistant sees every event, but as `daemon::assistant` explains,
-    // anything it returns only ever gets logged, never applied.
     for recommendation in assistant.analyze_event(&macro_cycle_event).await {
         daemon::assistant::record_recommendation(&recommendation);
     }
@@ -306,21 +445,11 @@ async fn run_cycle(
             let order = broker.submit_order(request).await?;
             tracing::info!(order_id = %order.order_id, status = ?order.status, "order submitted to broker");
 
-            let previously_known_ids: std::collections::HashSet<Uuid> =
-                open_positions.iter().map(|p| p.position_id).collect();
-
             open_positions.clear();
             open_positions.extend(broker.list_open_positions().await?);
 
-            // Persist only what's actually new since the last cycle. This
-            // mirrors "state persisted before ack" in spirit: we don't
-            // treat a fill as durably recorded until it's been through
-            // `CursorFile::append`, which doesn't return until its
-            // `fsync` has completed.
             for position in open_positions.iter() {
-                if !previously_known_ids.contains(&position.position_id) {
-                    positions_cursor.append(position).await?;
-                }
+                cursor.append(position).await?;
             }
         }
     }

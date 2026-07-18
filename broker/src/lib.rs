@@ -4,7 +4,11 @@
 //! why that's a deliberate scope decision rather than an oversight.
 
 pub mod adapter;
+pub mod deriv;
 pub mod mock;
+pub mod stubs;
 
 pub use adapter::{BrokerAdapter, BrokerCapabilities, BrokerError};
+pub use deriv::{DerivAdapter, DerivClient};
 pub use mock::{mock_health_status, MockBroker, ScriptedResponse};
+pub use stubs::BybitAdapter;

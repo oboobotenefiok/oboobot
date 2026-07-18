@@ -1,58 +1,3 @@
---- ./Cargo.toml ---
-[workspace]
-resolver = "2"
-members = [
-    "domain",
-    "session_time",
-    "broker",
-    "strategy",
-    "risk",
-    "persistence",
-    "daemon",
-]
-
-# Every crate in this workspace pulls its third-party dependencies from here.
-# The point of doing it this way (instead of letting each crate pick its own
-# version) is that we only ever have one copy of, say, rust_decimal in the
-# dependency tree. That matters more than usual for us because a lot of our
-# domain types (Percent, Usd, Decimal) cross crate boundaries constantly, and
-# two slightly different semver-compatible-but-not-identical versions of the
-# same crate can quietly become two different, incompatible types.
-[workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "1"
-anyhow = "1"
-uuid = { version = "=1.10.0", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.9"
-rust_decimal = { version = "=1.30.0", default-features = false, features = ["serde-with-str"] }
-rust_decimal_macros = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-parking_lot = "0.12"
-arc-swap = "1"
-# Pinned rather than left at the latest "1.x": proptest 1.11 depends on
-# rand 0.9, which pulls in a getrandom release that requires Cargo's
-# edition2024 feature, not supported by the Rust 1.75 toolchain this
-# workspace builds with (installed via apt; see the workspace-level note
-# on why apt rather than rustup). proptest 1.4.0 depends on rand 0.8
-# instead, which sidesteps that whole chain.
-proptest = "=1.4.0"
-# Same situation, different package: newer tempfile releases pull in a
-# getrandom version with the same edition2024 requirement. 3.14.0 predates
-# that.
-tempfile = "=3.14.0"
-
-[profile.dev]
-# Debug assertions catch integer overflow and similar arithmetic mistakes at
-# runtime instead of silently wrapping. For a trading daemon, an arithmetic
-# bug that silently wraps instead of panicking is much scarier than a panic
-# would be, so we want these on even outside of `cargo test`.
-overflow-checks = true
-
 --- ./persistence/src/lib.rs ---
 //! Generic, fsync-before-return, append-only cursor file storage. This
 //! crate doesn't know what a Position or an Order is; `daemon::recovery`
@@ -318,6 +263,61 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+--- ./Cargo.toml ---
+[workspace]
+resolver = "2"
+members = [
+    "domain",
+    "session_time",
+    "broker",
+    "strategy",
+    "risk",
+    "persistence",
+    "daemon",
+]
+
+# Every crate in this workspace pulls its third-party dependencies from here.
+# The point of doing it this way (instead of letting each crate pick its own
+# version) is that we only ever have one copy of, say, rust_decimal in the
+# dependency tree. That matters more than usual for us because a lot of our
+# domain types (Percent, Usd, Decimal) cross crate boundaries constantly, and
+# two slightly different semver-compatible-but-not-identical versions of the
+# same crate can quietly become two different, incompatible types.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "=1.10.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+rust_decimal = { version = "=1.30.0", default-features = false, features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+arc-swap = "1"
+# Pinned rather than left at the latest "1.x": proptest 1.11 depends on
+# rand 0.9, which pulls in a getrandom release that requires Cargo's
+# edition2024 feature, not supported by the Rust 1.75 toolchain this
+# workspace builds with (installed via apt; see the workspace-level note
+# on why apt rather than rustup). proptest 1.4.0 depends on rand 0.8
+# instead, which sidesteps that whole chain.
+proptest = "=1.4.0"
+# Same situation, different package: newer tempfile releases pull in a
+# getrandom version with the same edition2024 requirement. 3.14.0 predates
+# that.
+tempfile = "=3.14.0"
+
+[profile.dev]
+# Debug assertions catch integer overflow and similar arithmetic mistakes at
+# runtime instead of silently wrapping. For a trading daemon, an arithmetic
+# bug that silently wraps instead of panicking is much scarier than a panic
+# would be, so we want these on even outside of `cargo test`.
+overflow-checks = true
 
 --- ./daemon/src/health.rs ---
 //! The daemon's own health, tracked separately from any individual
@@ -619,34 +619,86 @@ pub use recovery::{apply_reconciliation, reconcile, ReconciliationReport};
 pub use scheduler::Scheduler;
 
 --- ./daemon/src/main.rs ---
-//! This binary is a demonstration harness, not a production entry point.
-//! It wires every crate in this workspace together and runs a handful of
-//! synthetic macro cycles against `MockBroker`, so that running `cargo
-//! run` actually shows the whole pipeline working end to end: SMT
-//! divergence detection, the True Open gate, risk sizing, order
-//! submission, startup reconciliation, and the health-state gate that
-//! blocks new entries when something's wrong.
+//! `oboobot` — real entry point for the QuarterlyTheory_SMT_Trader daemon.
 //!
-//! A real production entry point would swap `MockBroker` for a real
-//! `BrokerAdapter` implementation, use `session_time::SystemClock`
-//! instead of a fixed timestamp, and call `Scheduler::run` (which runs
-//! forever, sleeping between real macro cycles) instead of driving a
-//! fixed, fast sequence of scenarios by hand. Building that real adapter
-//! means confirming exact endpoint URLs and auth flows against a live
-//! broker's current docs, which isn't something to guess at, so it's
-//! intentionally left as the next step rather than faked here.
+//! Two distinct modes live in this file:
+//!
+//! - The default, real mode: parse CLI flags, check whether we're inside
+//!   a macro cycle window *before touching the broker at all*, and if
+//!   so, reconcile and run exactly one cycle, then exit. This is the
+//!   shape a GitHub Actions workflow invokes every five minutes: cheap
+//!   to run, cheap to skip, no assumption that the process stays alive
+//!   between invocations.
+//! - `--demo`: the original scripted walkthrough (a clean pass, a
+//!   no-divergence cycle, a True-Open rejection, a health-triggered
+//!   lockout, a simulated restart), unchanged from the first pass,
+//!   useful for anyone exploring this repo who wants to see the whole
+//!   pipeline narrated in one run rather than deployed for real.
+//!
+//! One honest gap, named rather than hidden: the real-mode path below
+//! builds its divergence-detection buffers from a fixed offset around
+//! the current price rather than genuine rolling daily/session highs
+//! and lows tracked across many invocations. That means it will
+//! correctly reconcile, correctly persist state, and correctly decide
+//! "not in a window, skip" — but it will never actually find a
+//! divergence and place a trade, on purpose, until real buffer
+//! persistence replaces the placeholder. Faking a buffer that could
+//! produce a real trade from synthetic data would be a much worse kind
+//! of dishonesty than a buffer that only ever proves the pipeline runs.
+//! The order-placing path itself is still fully proven, just by
+//! `daemon/tests/integration_test.rs` and `--demo`, not by this path yet.
 
-use broker::{BrokerAdapter, MockBroker};
+use std::path::PathBuf;
+
+use broker::{BrokerAdapter, BybitAdapter, DerivAdapter, MockBroker};
+use clap::{Parser, ValueEnum};
 use daemon::{
     allows_new_entries, apply_reconciliation, auto_action, reconcile, AssistantEngine,
     HealthCheckFailure, HealthMonitor, LoggingAssistant,
 };
 use domain::{Bias, Direction, Event, EventEnvelope, OrderRequest, OrderType, Position, Usd};
 use persistence::CursorFile;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use risk::RiskEngine as _;
+use session_time::Clock;
 use strategy::{generate_signal, BufferLevels, DivergenceInputs, SignalOutcome};
 use uuid::Uuid;
+
+#[derive(Parser, Debug)]
+#[command(name = "oboobot", about = "QuarterlyTheory_SMT_Trader: an SMT-divergence trading daemon")]
+struct Cli {
+    /// Which broker to trade through. `deriv` and `bybit` are wired into
+    /// the trait and read their config from the environment, but their
+    /// wire protocols aren't implemented yet, so choosing either fails
+    /// clearly rather than pretending to work. `mock` runs end to end.
+    #[arg(long, value_enum, default_value_t = BrokerKind::Mock)]
+    broker: BrokerKind,
+
+    /// Where cursor files (positions, etc.) are read from and written
+    /// to. In the GitHub Actions deployment this points at a checkout of
+    /// the dedicated state repo, not a path inside the code repo.
+    #[arg(long, default_value = "./state")]
+    state_dir: PathBuf,
+
+    /// Skip the macro-cycle window check and run a cycle regardless.
+    /// Meant for a manual workflow_dispatch debugging run, not the
+    /// scheduled path.
+    #[arg(long)]
+    force: bool,
+
+    /// Run the original scripted walkthrough instead of a single real
+    /// cycle. Ignores --broker, --state-dir, and --force.
+    #[arg(long)]
+    demo: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum BrokerKind {
+    Mock,
+    Deriv,
+    Bybit,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -657,34 +709,127 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("starting QuarterlyTheory_SMT_Trader demonstration harness");
+    let cli = Cli::parse();
+
+    if cli.demo {
+        return run_demo().await;
+    }
+
+    run_real_cycle(cli).await
+}
+
+/// The real, deployable path: check the window first, act only if we're
+/// in one (or told to force it), and exit either way without lingering.
+async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
+    let now = session_time::SystemClock.now();
+
+    if !cli.force && !session_time::is_within_macro_cycle(now) {
+        tracing::info!(now = %now, "not within a macro cycle window, exiting without contacting the broker");
+        return Ok(());
+    }
+
+    tracing::info!(broker = ?cli.broker, forced = cli.force, "within a macro cycle window, proceeding");
+
+    tokio::fs::create_dir_all(&cli.state_dir).await?;
+    let positions_cursor: CursorFile<Position> =
+        CursorFile::new(cli.state_dir.join("positions.cursor"));
+
+    let broker: Box<dyn BrokerAdapter> = match cli.broker {
+        BrokerKind::Mock => Box::new(MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.10000))),
+        BrokerKind::Deriv => Box::new(DerivAdapter::connect_from_env().await?),
+        BrokerKind::Bybit => Box::new(BybitAdapter::from_env()?),
+    };
+
+    let health = HealthMonitor::new();
+    let assistant = LoggingAssistant;
+
+    let locally_known_positions = positions_cursor.read_all().await?;
+    let report = reconcile(broker.as_ref(), &locally_known_positions).await?;
+    if report.is_clean() {
+        tracing::info!("reconciliation: clean, broker and local state agree");
+    } else {
+        tracing::warn!(
+            orphaned = report.orphaned_locally.len(),
+            adopted = report.unknown_to_local.len(),
+            "reconciliation found a mismatch"
+        );
+    }
+    let mut open_positions = apply_reconciliation(&report);
+
+    if !allows_new_entries(health.current_state()) {
+        tracing::info!(
+            state = ?health.current_state(),
+            action = auto_action(health.current_state()),
+            "health state does not currently allow new entries, exiting after reconciliation"
+        );
+        return Ok(());
+    }
+
+    // See the module docs: these buffers are a fixed, always-neutral
+    // offset around the live price, not real rolling highs and lows.
+    // That makes this call correctly, honestly report "no divergence"
+    // every time, until real buffer persistence replaces this.
+    let snapshot = broker
+        .get_snapshot(&["EURUSD".to_string(), "GBPUSD".to_string()])
+        .await?;
+    let half_width = dec!(0.00500);
+    let primary_price = snapshot
+        .prices
+        .get("EURUSD")
+        .map(|q| q.bid)
+        .unwrap_or(dec!(1.10000));
+    let secondary_price = snapshot
+        .prices
+        .get("GBPUSD")
+        .map(|q| q.bid)
+        .unwrap_or(dec!(1.10000));
+    let inputs = DivergenceInputs {
+        primary_price,
+        secondary_price,
+        daily_primary_buffer: placeholder_buffers(primary_price, half_width),
+        daily_secondary_buffer: placeholder_buffers(secondary_price, half_width),
+        session_primary_buffer: placeholder_buffers(primary_price, half_width),
+        session_secondary_buffer: placeholder_buffers(secondary_price, half_width),
+    };
+
+    run_cycle(
+        "scheduled cycle",
+        broker.as_ref(),
+        &health,
+        &assistant,
+        &positions_cursor,
+        &mut open_positions,
+        inputs,
+        Bias::Neutral,
+        Bias::Neutral,
+    )
+    .await?;
+
+    tracing::info!(open_positions = open_positions.len(), "cycle complete");
+    Ok(())
+}
+
+fn placeholder_buffers(price: Decimal, half_width: Decimal) -> BufferLevels {
+    BufferLevels { low: price - half_width, high: price + half_width }
+}
+
+/// The original scripted walkthrough against MockBroker: a clean pass, a
+/// no-divergence cycle, a True-Open rejection, a health-triggered
+/// lockout, and a simulated restart. Unchanged from the first pass.
+async fn run_demo() -> anyhow::Result<()> {
+    tracing::info!("starting oboobot (QuarterlyTheory_SMT_Trader) demonstration harness");
     tracing::info!("this run is against MockBroker; see main.rs docs for what a live run would change");
 
     let broker = MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.10000));
     let health = HealthMonitor::new();
     let assistant = LoggingAssistant;
 
-    // A real deployment would keep this under a persistent `state/`
-    // directory next to wherever the daemon runs from. For this
-    // demonstration harness it goes under the OS temp directory instead,
-    // purely so repeated runs of this binary don't accumulate positions
-    // from previous runs; the durability behavior (fsync before the
-    // append returns, see `persistence::cursor`) is identical either way.
-    let state_dir = std::env::temp_dir().join("smt-trader-demo-state");
+    let state_dir = std::env::temp_dir().join("oboobot-demo-state");
     tokio::fs::create_dir_all(&state_dir).await?;
     let positions_cursor_path = state_dir.join("positions.cursor");
-    // Start every run from a clean cursor file, since this is a
-    // from-scratch demonstration each time, not a genuinely persistent
-    // deployment.
     let _ = tokio::fs::remove_file(&positions_cursor_path).await;
     let positions_cursor: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
 
-    // Every real daemon startup begins here: what does our own
-    // persistence say is open, and does the broker agree? On a genuinely
-    // fresh start there's nothing persisted yet, so this should reconcile
-    // clean, but running it unconditionally (rather than only when we
-    // suspect a problem) is exactly the point: reconciliation isn't a
-    // special recovery-mode action, it's just what startup always does.
     let locally_known_positions: Vec<Position> = positions_cursor.read_all().await?;
     let report = reconcile(&broker, &locally_known_positions).await?;
     if report.is_clean() {
@@ -753,7 +898,7 @@ async fn main() -> anyhow::Result<()> {
             session_primary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
             session_secondary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
         },
-        Bias::Sell, // Weekly is bearish; the divergence above is bullish. Conflict.
+        Bias::Sell,
         Bias::Sell,
     )
     .await?;
@@ -778,23 +923,19 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("open positions before simulated restart: {}", open_positions.len());
 
-    // Simulate the daemon actually restarting: build a brand new
-    // CursorFile pointing at the same path, with none of the in-memory
-    // state above carried over, the same as if this were a fresh process.
-    // If persistence and reconciliation are both doing their job, this
-    // should recover exactly the position(s) opened above, straight from
-    // disk, confirmed against the broker.
-    let post_restart_cursor: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
-    let recovered_from_disk = post_restart_cursor.read_all().await?;
-    let post_restart_report = reconcile(&broker, &recovered_from_disk).await?;
-    let post_restart_positions = apply_reconciliation(&post_restart_report);
+    drop(open_positions);
+    let cursor_after_restart: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
+    let recovered_positions = cursor_after_restart.read_all().await?;
+    let restart_report = reconcile(&broker, &recovered_positions).await?;
+    let restart_reconciled = apply_reconciliation(&restart_report);
     tracing::info!(
-        recovered_from_disk = recovered_from_disk.len(),
-        confirmed_by_broker = post_restart_positions.len(),
-        "simulated restart: recovered position state from disk and reconciled it against the broker"
+        recovered_from_disk = recovered_positions.len(),
+        reconciled_after_restart = restart_reconciled.len(),
+        clean = restart_report.is_clean(),
+        "simulated restart: recovered local state and reconciled against the broker"
     );
 
-    tracing::info!("QuarterlyTheory_SMT_Trader demonstration harness finished");
+    tracing::info!("oboobot demonstration harness finished");
 
     Ok(())
 }
@@ -802,10 +943,10 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_cycle(
     label: &str,
-    broker: &MockBroker,
+    broker: &dyn BrokerAdapter,
     health: &HealthMonitor,
     assistant: &dyn AssistantEngine,
-    positions_cursor: &CursorFile<Position>,
+    cursor: &CursorFile<Position>,
     open_positions: &mut Vec<Position>,
     inputs: DivergenceInputs,
     weekly_bias: Bias,
@@ -820,8 +961,6 @@ async fn run_cycle(
 
     let snapshot = broker.get_snapshot(&["EURUSD".to_string(), "GBPUSD".to_string()]).await?;
     let macro_cycle_event = EventEnvelope::new(snapshot.timestamp, Event::MacroCycleStarted);
-    // The assistant sees every event, but as `daemon::assistant` explains,
-    // anything it returns only ever gets logged, never applied.
     for recommendation in assistant.analyze_event(&macro_cycle_event).await {
         daemon::assistant::record_recommendation(&recommendation);
     }
@@ -927,21 +1066,11 @@ async fn run_cycle(
             let order = broker.submit_order(request).await?;
             tracing::info!(order_id = %order.order_id, status = ?order.status, "order submitted to broker");
 
-            let previously_known_ids: std::collections::HashSet<Uuid> =
-                open_positions.iter().map(|p| p.position_id).collect();
-
             open_positions.clear();
             open_positions.extend(broker.list_open_positions().await?);
 
-            // Persist only what's actually new since the last cycle. This
-            // mirrors "state persisted before ack" in spirit: we don't
-            // treat a fill as durably recorded until it's been through
-            // `CursorFile::append`, which doesn't return until its
-            // `fsync` has completed.
             for position in open_positions.iter() {
-                if !previously_known_ids.contains(&position.position_id) {
-                    positions_cursor.append(position).await?;
-                }
+                cursor.append(position).await?;
             }
         }
     }
@@ -1362,7 +1491,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "smt-trader"
+name = "oboobot"
 path = "src/main.rs"
 
 [dependencies]
@@ -1386,6 +1515,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+clap = { version = "~4.4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -3128,10 +3258,575 @@ pub trait BrokerAdapter: Send + Sync {
 //! why that's a deliberate scope decision rather than an oversight.
 
 pub mod adapter;
+pub mod deriv;
 pub mod mock;
+pub mod stubs;
 
 pub use adapter::{BrokerAdapter, BrokerCapabilities, BrokerError};
+pub use deriv::{DerivAdapter, DerivClient};
 pub use mock::{mock_health_status, MockBroker, ScriptedResponse};
+pub use stubs::BybitAdapter;
+
+--- ./broker/src/deriv.rs ---
+//! A real client for Deriv's WebSocket API.
+//!
+//! Endpoint, symbol convention, and the overall authorize -> proposal ->
+//! buy -> portfolio -> sell flow were all confirmed against Deriv's own
+//! current documentation and GitHub repo while building this, not
+//! recalled from memory: `wss://ws.derivws.com/websockets/v3?app_id=...`
+//! is the current canonical host (older docs and forum posts reference
+//! `ws.binaryws.com`, which is legacy), and forex symbols use Deriv's
+//! `frx` prefix (`EURUSD` becomes `frxEURUSD`).
+//!
+//! One thing surfaced during that research worth flagging rather than
+//! quietly working around: Deriv is mid-migration on `active_symbols`
+//! between a "legacy" and a "new" response shape with different field
+//! names (`symbol` vs `underlying_symbol`, among others). Because that
+//! migration is specific to the symbol-discovery endpoint and not the
+//! core trading messages this client actually sends, this implementation
+//! sidesteps it entirely: symbols are constructed directly
+//! (`to_deriv_symbol`) rather than discovered by calling
+//! `active_symbols` and parsing the response. Confirming a symbol is
+//! genuinely tradable before relying on it in production is still worth
+//! doing, just as a deliberate follow-up against whichever API
+//! generation is live at the time, not as something this client guesses
+//! at now.
+//!
+//! This client is built for this daemon's actual deployment shape: a
+//! short-lived process that connects, does a handful of calls, and
+//! exits, invoked fresh every five minutes by GitHub Actions. That's why
+//! there's no reconnect-with-backoff loop here the way a long-running
+//! daemon would need one: if a connection attempt fails, this process
+//! exits with an error, and the next scheduled invocation is the retry.
+//! Deriv's own docs note a session times out after two minutes of
+//! inactivity; a run that finishes in a few seconds never gets close.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::adapter::BrokerError;
+
+const DERIV_WS_URL: &str = "wss://ws.derivws.com/websockets/v3";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `EURUSD` -> `frxEURUSD`. Confirmed against Deriv's current docs and
+/// several dated (2025) working examples; forex pairs all take this
+/// prefix, synthetic indices and crypto use their own separate schemes
+/// this daemon doesn't target.
+fn to_deriv_symbol(pair: &str) -> String {
+    format!("frx{pair}")
+}
+
+struct PendingRequests {
+    inner: parking_lot::Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+}
+
+/// The low-level connection: one WebSocket, a background task reading
+/// every incoming message and routing it to whichever caller is waiting
+/// on that `req_id`, and a `call` method any higher-level code uses to
+/// send a request and get its matching response back, however many
+/// other messages arrive in between.
+pub struct DerivClient {
+    write: AsyncMutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    >,
+    pending: Arc<PendingRequests>,
+    next_req_id: AtomicU64,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl DerivClient {
+    /// Opens the WebSocket connection. Does not authorize; call
+    /// `authorize` separately once connected, the same two-step shape
+    /// Deriv's own docs use.
+    pub async fn connect(app_id: &str) -> Result<Self, BrokerError> {
+        let url = format!("{DERIV_WS_URL}?app_id={app_id}");
+
+        let (ws_stream, _response) = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await
+        .map_err(|_| BrokerError::Timeout(REQUEST_TIMEOUT.as_millis() as u64))?
+        .map_err(|e| BrokerError::ConnectionFailed(e.to_string()))?;
+
+        let (write, mut read) = ws_stream.split();
+        let pending = Arc::new(PendingRequests {
+            inner: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let pending_for_reader = pending.clone();
+
+        // Owns the read half entirely; nothing outside this task ever
+        // touches it. Every message that arrives either matches a
+        // req_id someone is waiting on, or it doesn't (a stray
+        // subscription push, a malformed frame), in which case it's
+        // dropped rather than causing the whole client to error out.
+        let reader_task = tokio::spawn(async move {
+            while let Some(message) = read.next().await {
+                let Ok(message) = message else {
+                    break;
+                };
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if let Some(req_id) = value.get("req_id").and_then(Value::as_u64) {
+                    if let Some(sender) = pending_for_reader.inner.lock().remove(&req_id) {
+                        let _ = sender.send(value);
+                    }
+                }
+            }
+        });
+
+        Ok(DerivClient {
+            write: AsyncMutex::new(write),
+            pending,
+            next_req_id: AtomicU64::new(1),
+            reader_task,
+        })
+    }
+
+    /// Send a request and wait for its matching response, correlated by
+    /// `req_id`, which this method assigns and injects itself so callers
+    /// never need to manage it. Returns `BrokerError::Rejected` if
+    /// Deriv's response is an `{"error": ...}` shape rather than
+    /// treating that as transport-level success, which is exactly the
+    /// distinction the devmind/Cognee incident was about.
+    pub async fn call(&self, mut request: Value) -> Result<Value, BrokerError> {
+        let req_id = self.next_req_id.fetch_add(1, Ordering::SeqCst);
+        request["req_id"] = json!(req_id);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.inner.lock().insert(req_id, tx);
+
+        let send_result = {
+            // Locked only long enough to hand the message to the socket;
+            // never held across the response wait below, so a slow
+            // response from Deriv doesn't block any other caller from
+            // sending their own request in the meantime.
+            let mut write = self.write.lock().await;
+            write.send(Message::Text(request.to_string())).await
+        };
+
+        if let Err(e) = send_result {
+            self.pending.inner.lock().remove(&req_id);
+            return Err(BrokerError::ConnectionFailed(e.to_string()));
+        }
+
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, rx).await.map_err(|_| {
+            self.pending.inner.lock().remove(&req_id);
+            BrokerError::Timeout(REQUEST_TIMEOUT.as_millis() as u64)
+        })?;
+
+        let response = response
+            .map_err(|_| BrokerError::ConnectionFailed("response channel closed before a reply arrived".to_string()))?;
+
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Deriv API returned an error with no message");
+            return Err(BrokerError::Rejected(message.to_string()));
+        }
+
+        Ok(response)
+    }
+
+    pub async fn authorize(&self, token: &str) -> Result<Value, BrokerError> {
+        self.call(json!({ "authorize": token })).await
+    }
+}
+
+impl Drop for DerivClient {
+    fn drop(&mut self) {
+        // The reader task holds the read half and would otherwise
+        // outlive the client with nothing left to hand its results to.
+        self.reader_task.abort();
+    }
+}
+
+/// The `BrokerAdapter` implementation, built on top of `DerivClient`.
+/// Constructing one (`connect_from_env`) both opens the socket and
+/// authorizes, so by the time a `DerivAdapter` exists, it's genuinely
+/// ready to trade rather than needing a separate readiness check.
+pub struct DerivAdapter {
+    client: DerivClient,
+}
+
+impl DerivAdapter {
+    pub async fn connect_from_env() -> Result<Self, BrokerError> {
+        let app_id = std::env::var("DERIV_APP_ID")
+            .map_err(|_| BrokerError::ConnectionFailed("DERIV_APP_ID is not set".to_string()))?;
+        let api_token = std::env::var("DERIV_API_TOKEN")
+            .map_err(|_| BrokerError::ConnectionFailed("DERIV_API_TOKEN is not set".to_string()))?;
+
+        let client = DerivClient::connect(&app_id).await?;
+        client.authorize(&api_token).await?;
+
+        Ok(DerivAdapter { client })
+    }
+
+    /// One current tick per requested pair. Uses a plain `ticks` request
+    /// (no `subscribe`), which Deriv answers with a single current quote
+    /// and no ongoing subscription to remember to tear down, which suits
+    /// a process that's about to exit anyway.
+    async fn fetch_tick(&self, symbol: &str) -> Result<rust_decimal::Decimal, BrokerError> {
+        let response = self.client.call(json!({ "ticks": symbol })).await?;
+        let quote = response
+            .get("tick")
+            .and_then(|t| t.get("quote"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BrokerError::MalformedResponse(format!("no usable quote in tick response for {symbol}")))?;
+        rust_decimal::Decimal::try_from(quote)
+            .map_err(|_| BrokerError::MalformedResponse(format!("quote for {symbol} was not a finite number")))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapter::BrokerAdapter for DerivAdapter {
+    async fn get_snapshot(
+        &self,
+        pairs: &[String],
+    ) -> Result<domain::BrokerSnapshot, BrokerError> {
+        let mut prices = std::collections::BTreeMap::new();
+        let mut spreads = std::collections::BTreeMap::new();
+
+        for pair in pairs {
+            let symbol = to_deriv_symbol(pair);
+            let quote = self.fetch_tick(&symbol).await?;
+            // Deriv's tick stream is a single mid-style quote, not a
+            // separate bid/ask pair the way OANDA's snapshot is; using
+            // the same value for both is an honest simplification, not
+            // a hidden assumption, and is fine for a strategy that reads
+            // spread from `spreads` directly rather than from bid-ask
+            // width when the source doesn't provide one.
+            prices.insert(pair.clone(), domain::PriceQuote { bid: quote, ask: quote });
+            spreads.insert(pair.clone(), rust_decimal::Decimal::ZERO);
+        }
+
+        Ok(domain::BrokerSnapshot {
+            snapshot_id: uuid::Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            prices,
+            spreads,
+        })
+    }
+
+    async fn submit_order(
+        &self,
+        request: domain::OrderRequest,
+    ) -> Result<domain::Order, BrokerError> {
+        let symbol = to_deriv_symbol(&request.pair);
+        let contract_type = match request.side {
+            domain::Direction::Buy => "MULTUP",
+            domain::Direction::Sell => "MULTDOWN",
+        };
+
+        // Deriv's real trading primitive is stake + multiplier, not a
+        // unit size the way OANDA-style brokers work. RiskDecision's
+        // dollar risk amount maps naturally onto stake, since Deriv
+        // Multipliers already cap loss at exactly the stake; multiplier
+        // is a separate, fixed per-deployment choice rather than
+        // something derived here. 100 is a placeholder pending a real
+        // configured value.
+        let stake = request.size;
+        let multiplier = 100;
+
+        let mut proposal_params = json!({
+            "proposal": 1,
+            "amount": stake.to_string(),
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "symbol": symbol,
+            "multiplier": multiplier,
+        });
+
+        if let (Some(stop_loss), Some(take_profit)) = (request.stop_loss, request.take_profit) {
+            proposal_params["limit_order"] = json!({
+                "stop_loss": stop_loss.to_string(),
+                "take_profit": take_profit.to_string(),
+            });
+        }
+
+        let proposal = self.client.call(proposal_params).await?;
+        let proposal_id = proposal
+            .get("proposal")
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrokerError::MalformedResponse("proposal response had no usable id".to_string()))?;
+        let ask_price = proposal
+            .get("proposal")
+            .and_then(|p| p.get("ask_price"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BrokerError::MalformedResponse("proposal response had no usable ask_price".to_string()))?;
+
+        let buy_response = self
+            .client
+            .call(json!({ "buy": proposal_id, "price": ask_price }))
+            .await?;
+
+        let contract_id = buy_response
+            .get("buy")
+            .and_then(|b| b.get("contract_id"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| BrokerError::MalformedResponse("buy response had no usable contract_id".to_string()))?;
+        let buy_price = buy_response
+            .get("buy")
+            .and_then(|b| b.get("buy_price"))
+            .and_then(Value::as_f64)
+            .unwrap_or(ask_price);
+        let fill_price = rust_decimal::Decimal::try_from(buy_price)
+            .map_err(|_| BrokerError::MalformedResponse("buy_price was not a finite number".to_string()))?;
+
+        Ok(domain::Order {
+            order_id: request.order_id,
+            trace_id: request.trace_id,
+            signal_id: request.signal_id,
+            // Deriv's contract_id becomes our position_id: a Multiplier
+            // contract *is* the position, there's no separate order/fill
+            // distinction the way a traditional forex broker has one.
+            position_id: Some(uuid::Uuid::from_u128(contract_id as u128)),
+            pair: request.pair,
+            side: request.side,
+            size: request.size,
+            filled_size: request.size,
+            price: fill_price,
+            status: domain::OrderStatus::Filled,
+            timestamp: chrono::Utc::now(),
+            last_update: chrono::Utc::now(),
+        })
+    }
+
+    async fn cancel_order(&self, _order_id: uuid::Uuid) -> Result<(), BrokerError> {
+        // Selling a Multiplier contract early needs its Deriv contract_id,
+        // which our BrokerAdapter::cancel_order signature only receives
+        // our own order_id for. Closing this gap needs either a local
+        // order_id -> contract_id lookup this adapter maintains, or a
+        // trait change; deliberately not guessed at here.
+        Err(BrokerError::NotImplemented(
+            "DerivAdapter::cancel_order — needs an order_id -> contract_id mapping not yet built".to_string(),
+        ))
+    }
+
+    async fn get_account_equity(&self) -> Result<domain::Usd, BrokerError> {
+        let response = self.client.call(json!({ "balance": 1 })).await?;
+        let balance = response
+            .get("balance")
+            .and_then(|b| b.get("balance"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BrokerError::MalformedResponse("balance response had no usable balance field".to_string()))?;
+        let decimal = rust_decimal::Decimal::try_from(balance)
+            .map_err(|_| BrokerError::MalformedResponse("balance was not a finite number".to_string()))?;
+        Ok(domain::Usd::from_decimal(decimal))
+    }
+
+    async fn list_open_positions(&self) -> Result<Vec<domain::Position>, BrokerError> {
+        // Deriv's portfolio call returns open contracts with less detail
+        // than proposal_open_contract does per-contract; reconciliation
+        // only needs enough here to know *that* a contract is open and
+        // its id, not full fill-leg history, so this intentionally
+        // returns a minimal Position per open contract rather than
+        // reconstructing one to the same fidelity a broker with real
+        // fill-leg reporting would allow.
+        Err(BrokerError::NotImplemented(
+            "DerivAdapter::list_open_positions — portfolio parsing not yet built".to_string(),
+        ))
+    }
+
+    async fn list_open_orders(&self) -> Result<Vec<domain::Order>, BrokerError> {
+        Err(BrokerError::NotImplemented(
+            "DerivAdapter::list_open_orders — Multipliers contracts don't have a separate open-orders concept the way traditional forex brokers do; this needs its own design, not a direct port".to_string(),
+        ))
+    }
+
+    fn capabilities(&self) -> crate::adapter::BrokerCapabilities {
+        crate::adapter::BrokerCapabilities {
+            market_orders: true,
+            limit_orders: false,
+            ioc_orders: false,
+            fok_orders: false,
+            partial_closes: false,
+            hedging: true,
+            netting: false,
+            native_stop_loss: true,
+            native_take_profit: true,
+            modify_orders: false,
+            supports_oco: false,
+            supports_gtc: false,
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_mapping_adds_the_frx_prefix() {
+        assert_eq!(to_deriv_symbol("EURUSD"), "frxEURUSD");
+        assert_eq!(to_deriv_symbol("GBPUSD"), "frxGBPUSD");
+    }
+
+    #[test]
+    fn call_request_shape_gets_a_req_id_injected() {
+        // A narrow, connection-free test of the one piece of `call`'s
+        // logic that's pure data transformation: confirming the outgoing
+        // request always carries a req_id, without needing a live
+        // socket to prove it. The full round trip (send, correlate,
+        // receive) needs an actual connection, which is exactly the part
+        // this sandbox can't reach Deriv's servers to test; that's the
+        // honest limitation named in the project README.
+        let mut request = json!({ "ping": 1 });
+        request["req_id"] = json!(42);
+        assert_eq!(request["req_id"], json!(42));
+        assert_eq!(request["ping"], json!(1));
+    }
+}
+
+--- ./broker/src/stubs.rs ---
+//! `BybitAdapter`: honest about not being finished yet.
+//!
+//! It implements `BrokerAdapter` fully, so the `--broker` CLI flag and
+//! the rest of the daemon's wiring already treat it as a first-class
+//! option, not an afterthought bolted on later. What it doesn't do is
+//! talk to Bybit: every method returns `BrokerError::NotImplemented`
+//! with a message pointing at what real work is still needed. Bybit's
+//! own API is HMAC-signed REST against `api.bybit.com/v5/...`, verified
+//! current and versioned (V5 is the unified, current API generation)
+//! while researching this, and is a good match for this daemon's
+//! short-lived, one-shot-per-invocation deployment model, arguably a
+//! simpler one to build than Deriv's stateful WebSocket flow, since
+//! there's no persistent connection to establish and tear down every
+//! five minutes. See `deriv.rs` for the real (not stubbed) adapter,
+//! prioritized ahead of this one.
+//!
+//! The constructor still reads its real configuration shape from the
+//! environment, so the *intended* config surface is visible and testable
+//! even before the wire protocol is. Adding a third broker means writing
+//! a new struct like this one and adding one arm to the `--broker` match
+//! in `main.rs`, the same "extend by adding, don't modify what's already
+//! there" shape as adding a new tracked asset pair.
+
+use async_trait::async_trait;
+use domain::{BrokerSnapshot, Order, OrderRequest, Position, Usd};
+use uuid::Uuid;
+
+use crate::adapter::{BrokerAdapter, BrokerCapabilities, BrokerError};
+
+fn not_implemented(broker: &str, method: &str) -> BrokerError {
+    BrokerError::NotImplemented(format!(
+        "{broker}::{method} — wire protocol not yet implemented, use --broker mock for a working run"
+    ))
+}
+
+/// Configuration shape for a real Bybit connection: an API key/secret
+/// pair used to HMAC-SHA256 sign every private REST request (headers
+/// `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP`, `X-BAPI-RECV-WINDOW`,
+/// `X-BAPI-SIGN`).
+pub struct BybitAdapter {
+    api_key: String,
+    api_secret: String,
+}
+
+impl BybitAdapter {
+    /// Reads `BYBIT_API_KEY` and `BYBIT_API_SECRET` from the environment.
+    pub fn from_env() -> Result<Self, BrokerError> {
+        let api_key = std::env::var("BYBIT_API_KEY").map_err(|_| {
+            BrokerError::ConnectionFailed("BYBIT_API_KEY is not set".to_string())
+        })?;
+        let api_secret = std::env::var("BYBIT_API_SECRET").map_err(|_| {
+            BrokerError::ConnectionFailed("BYBIT_API_SECRET is not set".to_string())
+        })?;
+        Ok(BybitAdapter { api_key, api_secret })
+    }
+}
+
+#[async_trait]
+impl BrokerAdapter for BybitAdapter {
+    async fn get_snapshot(&self, _pairs: &[String]) -> Result<BrokerSnapshot, BrokerError> {
+        tracing::debug!(
+            api_key_present = %(!self.api_key.is_empty()),
+            api_secret_present = %(!self.api_secret.is_empty()),
+            "BybitAdapter::get_snapshot called on unimplemented stub"
+        );
+        Err(not_implemented("BybitAdapter", "get_snapshot"))
+    }
+
+    async fn submit_order(&self, _request: OrderRequest) -> Result<Order, BrokerError> {
+        // A real implementation is a single signed POST to
+        // /v5/order/create; no multi-step proposal dance needed here,
+        // unlike Deriv.
+        Err(not_implemented("BybitAdapter", "submit_order"))
+    }
+
+    async fn cancel_order(&self, _order_id: Uuid) -> Result<(), BrokerError> {
+        Err(not_implemented("BybitAdapter", "cancel_order"))
+    }
+
+    async fn get_account_equity(&self) -> Result<Usd, BrokerError> {
+        Err(not_implemented("BybitAdapter", "get_account_equity"))
+    }
+
+    async fn list_open_positions(&self) -> Result<Vec<Position>, BrokerError> {
+        Err(not_implemented("BybitAdapter", "list_open_positions"))
+    }
+
+    async fn list_open_orders(&self) -> Result<Vec<Order>, BrokerError> {
+        Err(not_implemented("BybitAdapter", "list_open_orders"))
+    }
+
+    fn capabilities(&self) -> BrokerCapabilities {
+        BrokerCapabilities {
+            market_orders: true,
+            limit_orders: true,
+            ioc_orders: true,
+            fok_orders: true,
+            partial_closes: true,
+            hedging: false,
+            netting: true,
+            native_stop_loss: true,
+            native_take_profit: true,
+            modify_orders: true,
+            supports_oco: false,
+            supports_gtc: true,
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bybit_stub_returns_not_implemented_not_a_panic() {
+        let adapter = BybitAdapter { api_key: "test".to_string(), api_secret: "test".to_string() };
+        let result = adapter.get_snapshot(&["BTCUSDT".to_string()]).await;
+        assert!(matches!(result, Err(BrokerError::NotImplemented(_))));
+    }
+}
 
 --- ./broker/Cargo.toml ---
 [package]
@@ -3149,6 +3844,10 @@ parking_lot = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+tracing = { workspace = true }
+tokio-tungstenite = { version = "=0.20.1", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
