@@ -1,0 +1,33 @@
+# oboobot configuration. Copy this to config.toml (or point --config at
+# your own copy) and adjust. None of this is secret — API keys and
+# webhook URLs are read from environment variables named here, never
+# written directly into this file, since this file is meant to live in
+# an open-source repo.
+
+[risk]
+base_risk_percent = 1.0
+max_risk_percent = 5.0
+max_open_positions = 5
+daily_loss_limit_percent = 5.0
+weekly_loss_limit_percent = 10.0
+# Spread must be under (72h average spread) * this multiplier to trade.
+# Must be greater than 1.0.
+spread_multiplier = 1.5
+# How far the live correlation coefficient can drift from baseline
+# before it's flagged as a regime shift. A fraction, not a percentage
+# (0.20 means 20 percentage points of coefficient, e.g. 0.90 -> 0.70).
+regime_shift_threshold = 0.20
+
+# One entry per correlated pair this strategy watches. Add another pair
+# by adding another [[pairs]] block below, nothing else changes.
+[[pairs]]
+primary = "EURUSD"
+secondary = "GBPUSD"
+
+[notifications]
+# Names of environment variables holding webhook credentials, not the
+# credentials themselves. Leave commented out to disable notifications
+# entirely (the default: a NoopNotifier that only logs).
+# slack_webhook_env = "SLACK_WEBHOOK_URL"
+# telegram_bot_token_env = "TELEGRAM_BOT_TOKEN"
+# telegram_chat_id_env = "TELEGRAM_CHAT_ID"

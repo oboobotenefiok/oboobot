@@ -9,6 +9,7 @@ session_time = { path = "../session_time" }
 rust_decimal = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }

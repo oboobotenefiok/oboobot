@@ -77,6 +77,10 @@ impl BrokerAdapter for BybitAdapter {
         Err(not_implemented("BybitAdapter", "cancel_order"))
     }
 
+    async fn close_position(&self, _position_id: Uuid) -> Result<Order, BrokerError> {
+        Err(not_implemented("BybitAdapter", "close_position"))
+    }
+
     async fn get_account_equity(&self) -> Result<Usd, BrokerError> {
         Err(not_implemented("BybitAdapter", "get_account_equity"))
     }

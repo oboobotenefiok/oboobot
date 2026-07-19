@@ -293,6 +293,13 @@ pub struct Position {
     pub last_update: DateTime<Utc>,
     pub status: PositionStatus,
     pub exit_reason: Option<ExitReason>,
+    /// The stop-loss and take-profit this position was opened with.
+    /// `Option` because a broker or an order type might not always set
+    /// one (or either): exit-condition monitoring treats a `None` here
+    /// as "no risk-reward exit configured for this position," not as a
+    /// missing-data error.
+    pub stop_loss: Option<Decimal>,
+    pub take_profit: Option<Decimal>,
 }
 
 impl Position {

@@ -343,14 +343,60 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
     }
 
     async fn cancel_order(&self, _order_id: uuid::Uuid) -> Result<(), BrokerError> {
-        // Selling a Multiplier contract early needs its Deriv contract_id,
-        // which our BrokerAdapter::cancel_order signature only receives
-        // our own order_id for. Closing this gap needs either a local
-        // order_id -> contract_id lookup this adapter maintains, or a
-        // trait change; deliberately not guessed at here.
+        // Deriv Multipliers don't have a separate pending-order concept
+        // the way traditional forex brokers do (a `buy` either fills or
+        // is rejected outright, there's no resting order to cancel), so
+        // this stays NotImplemented rather than being force-fit into a
+        // shape Deriv's model doesn't actually have.
         Err(BrokerError::NotImplemented(
-            "DerivAdapter::cancel_order — needs an order_id -> contract_id mapping not yet built".to_string(),
+            "DerivAdapter::cancel_order — Multipliers don't have a pending-order concept to cancel".to_string(),
         ))
+    }
+
+    async fn close_position(&self, position_id: uuid::Uuid) -> Result<domain::Order, BrokerError> {
+        // We encoded the Deriv contract_id into position_id as
+        // Uuid::from_u128(contract_id) when the position was opened;
+        // decode it back rather than maintaining a separate lookup table.
+        let contract_id = position_id.as_u128() as u64;
+
+        let response = self
+            .client
+            .call(json!({ "sell": contract_id, "price": 0 }))
+            .await?;
+
+        let sold = response
+            .get("sell")
+            .ok_or_else(|| BrokerError::MalformedResponse("sell response had no usable sell field".to_string()))?;
+        let sold_for = sold
+            .get("sold_for")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BrokerError::MalformedResponse("sell response had no usable sold_for".to_string()))?;
+        let price = rust_decimal::Decimal::try_from(sold_for)
+            .map_err(|_| BrokerError::MalformedResponse("sold_for was not a finite number".to_string()))?;
+
+        // Deriv's sell response doesn't carry the original pair, size,
+        // trace_id, or signal_id, and this adapter doesn't maintain a
+        // separate contract_id -> those-fields lookup yet, so this
+        // Order is honest about what it actually knows (that the
+        // position closed, and at what price) rather than fabricating
+        // plausible-looking values for the rest. A caller that needs
+        // those fields should already have them from when it opened the
+        // position; closing this gap for real means this adapter
+        // tracking its own local contract metadata, not guessed at here.
+        Ok(domain::Order {
+            order_id: uuid::Uuid::new_v4(),
+            trace_id: uuid::Uuid::new_v4(),
+            signal_id: uuid::Uuid::new_v4(),
+            position_id: Some(position_id),
+            pair: String::new(),
+            side: domain::Direction::Sell,
+            size: rust_decimal::Decimal::ZERO,
+            filled_size: rust_decimal::Decimal::ZERO,
+            price,
+            status: domain::OrderStatus::Filled,
+            timestamp: chrono::Utc::now(),
+            last_update: chrono::Utc::now(),
+        })
     }
 
     async fn get_account_equity(&self) -> Result<domain::Usd, BrokerError> {

@@ -44,6 +44,7 @@ proptest = "=1.4.0"
 # getrandom version with the same edition2024 requirement. 3.14.0 predates
 # that.
 tempfile = "=3.14.0"
+toml = "0.8"
 
 [profile.dev]
 # Debug assertions catch integer overflow and similar arithmetic mistakes at

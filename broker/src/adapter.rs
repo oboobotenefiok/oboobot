@@ -88,6 +88,13 @@ pub trait BrokerAdapter: Send + Sync {
 
     async fn cancel_order(&self, order_id: Uuid) -> Result<(), BrokerError>;
 
+    /// Close an existing open position at market. Distinct from
+    /// `cancel_order`, which cancels a pending order that hasn't filled
+    /// yet: this closes something that's already open, which is what
+    /// exit-condition monitoring (risk-reward, pre-news, SMT
+    /// contradiction) actually needs.
+    async fn close_position(&self, position_id: Uuid) -> Result<Order, BrokerError>;
+
     async fn get_account_equity(&self) -> Result<Usd, BrokerError>;
 
     /// The broker's own account of what's open right now. This is what

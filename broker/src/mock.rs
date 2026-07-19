@@ -184,11 +184,12 @@ impl BrokerAdapter for MockBroker {
                 // the synthetic market price for a Market order that
                 // didn't specify one).
                 let fill_price = request.price.unwrap_or_else(|| self.state.lock().synthetic_price);
+                let position_id = Uuid::new_v4();
                 let order = Order {
                     order_id: request.order_id,
                     trace_id: request.trace_id,
                     signal_id: request.signal_id,
-                    position_id: None,
+                    position_id: Some(position_id),
                     pair: request.pair.clone(),
                     side: request.side,
                     size: request.size,
@@ -201,7 +202,7 @@ impl BrokerAdapter for MockBroker {
                 self.state.lock().orders.insert(order.order_id, order.clone());
 
                 let position = Position {
-                    position_id: Uuid::new_v4(),
+                    position_id,
                     trace_id: request.trace_id,
                     signal_id: request.signal_id,
                     pair: request.pair,
@@ -219,6 +220,8 @@ impl BrokerAdapter for MockBroker {
                     last_update: Utc::now(),
                     status: PositionStatus::Filled,
                     exit_reason: None,
+                    stop_loss: request.stop_loss,
+                    take_profit: request.take_profit,
                 };
                 self.state.lock().positions.insert(position.position_id, position);
 
@@ -235,6 +238,41 @@ impl BrokerAdapter for MockBroker {
         } else {
             Err(BrokerError::NotFound(order_id))
         }
+    }
+
+    async fn close_position(&self, position_id: Uuid) -> Result<Order, BrokerError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        let mut guard = self.state.lock();
+        let close_price = guard.synthetic_price;
+
+        let Some(position) = guard.positions.remove(&position_id) else {
+            return Err(BrokerError::NotFound(position_id));
+        };
+
+        let direction_multiplier = match position.direction {
+            domain::Direction::Buy => Decimal::ONE,
+            domain::Direction::Sell => -Decimal::ONE,
+        };
+        let realized_pnl = (close_price - position.entry_price) * position.legs.iter().map(|l| l.size).sum::<Decimal>() * direction_multiplier;
+
+        let order = Order {
+            order_id: Uuid::new_v4(),
+            trace_id: position.trace_id,
+            signal_id: position.signal_id,
+            position_id: Some(position.position_id),
+            pair: position.pair,
+            side: position.direction.opposite(),
+            size: position.legs.iter().map(|l| l.size).sum(),
+            filled_size: position.legs.iter().map(|l| l.size).sum(),
+            price: close_price,
+            status: OrderStatus::Filled,
+            timestamp: Utc::now(),
+            last_update: Utc::now(),
+        };
+        guard.orders.insert(order.order_id, order.clone());
+        guard.equity = Usd::from_decimal(guard.equity.as_decimal() + realized_pnl);
+
+        Ok(order)
     }
 
     async fn get_account_equity(&self) -> Result<Usd, BrokerError> {
@@ -358,6 +396,25 @@ mod tests {
         assert!(third.is_ok());
     }
 
+    #[tokio::test]
+    async fn close_position_removes_it_and_returns_a_closing_order() {
+        let broker = MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.1000));
+        let order = broker.submit_order(sample_request()).await.unwrap();
+        let position_id = order.position_id.expect("normal fill path always sets position_id");
+
+        let closing_order = broker.close_position(position_id).await.unwrap();
+        assert_eq!(closing_order.status, OrderStatus::Filled);
+
+        let positions = broker.list_open_positions().await.unwrap();
+        assert!(positions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_an_unknown_position_returns_not_found() {
+        let broker = MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.1000));
+        let result = broker.close_position(Uuid::new_v4()).await;
+        assert!(matches!(result, Err(BrokerError::NotFound(_))));
+    }
     #[tokio::test]
     async fn forget_position_simulates_a_broker_side_orphan() {
         let broker = MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.1000));

@@ -9,6 +9,7 @@
 pub mod calendar;
 pub mod macro_cycle;
 pub mod true_open;
+pub mod true_open_capture;
 
 pub use calendar::{
     is_full_trading_week, ny_tz, to_ny, week_start_for, Clock, HolidayProvider, ManualClock,
@@ -19,3 +20,4 @@ pub use true_open::{
     bias_from_price, true_open_gate, week_qualifies_for_weekly_true_open, Timeframe,
     TrueOpenLevel,
 };
+pub use true_open_capture::{capture_level, needs_capture, next_ny_occurrence, DAILY_CAPTURE_HOUR_NY, WEEKLY_CAPTURE_HOUR_NY};

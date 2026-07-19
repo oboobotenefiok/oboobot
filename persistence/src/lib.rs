@@ -4,5 +4,7 @@
 //! reconciled state against a live broker.
 
 pub mod cursor;
+pub mod snapshot;
 
 pub use cursor::{CursorFile, PersistenceError};
+pub use snapshot::SnapshotFile;

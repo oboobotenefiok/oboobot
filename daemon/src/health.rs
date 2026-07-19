@@ -14,6 +14,84 @@
 
 use domain::SystemState;
 
+#[derive(Debug, thiserror::Error)]
+pub enum HeartbeatError<E: std::fmt::Display> {
+    #[error("broker call failed: {0}")]
+    CallFailed(E),
+    #[error("broker call exceeded {0:?} timeout")]
+    TimedOut(std::time::Duration),
+}
+
+/// Times a broker call and reports `BrokerHeartbeatFailure` if it either
+/// errors or takes longer than `timeout`. Generic over the call itself
+/// so it works for whatever broker method the caller wants to use as
+/// the heartbeat (typically `get_snapshot`, since every real cycle
+/// calls that anyway).
+///
+/// Returns `HeartbeatError` rather than trying to force "the call
+/// failed" and "the call never finished in time" into the same error
+/// type: they're genuinely different failure modes with different `E`
+/// shapes underneath (a real broker error vs. no error at all, just no
+/// response), and collapsing them would have meant either losing that
+/// distinction or reaching for `unreachable!()` on a branch that isn't
+/// actually unreachable.
+pub async fn check_broker_heartbeat<F, T, E>(
+    monitor: &HealthMonitor,
+    timeout: std::time::Duration,
+    call: F,
+) -> Result<T, HeartbeatError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(timeout, call).await {
+        Ok(Ok(value)) => {
+            monitor.clear_failure(HealthCheckFailure::BrokerHeartbeatFailure);
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            monitor.report_failure(HealthCheckFailure::BrokerHeartbeatFailure);
+            Err(HeartbeatError::CallFailed(error))
+        }
+        Err(_elapsed) => {
+            monitor.report_failure(HealthCheckFailure::BrokerHeartbeatFailure);
+            Err(HeartbeatError::TimedOut(timeout))
+        }
+    }
+}
+
+/// Best-effort available disk space, in megabytes, for the filesystem
+/// containing `path`. Shells out to `df` rather than pulling in a crate
+/// for this, since the daemon's real deployment target (GitHub Actions'
+/// `ubuntu-latest` runners) always has it, and a failure to run or parse
+/// it degrades to `None` rather than an error: a disk check that can't
+/// itself run shouldn't be able to take the whole cycle down.
+pub async fn available_disk_mb(path: &std::path::Path) -> Option<u64> {
+    let output = tokio::process::Command::new("df")
+        .arg("-Pm") // POSIX output format, megabyte blocks
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let data_line = text.lines().nth(1)?;
+    let available_field = data_line.split_whitespace().nth(3)?;
+    available_field.parse::<u64>().ok()
+}
+
+/// Best-effort resident memory usage of this process, in megabytes,
+/// read from `/proc/self/status`. Same reasoning as the disk check:
+/// Linux-specific, matching the actual deployment target, degrades to
+/// `None` rather than erroring if unavailable.
+pub async fn resident_memory_mb() -> Option<u64> {
+    let contents = tokio::fs::read_to_string("/proc/self/status").await.ok()?;
+    let line = contents.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kb_str = line.split_whitespace().nth(1)?;
+    let kb: u64 = kb_str.parse().ok()?;
+    Some(kb / 1024)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HealthCheckFailure {
     BrokerHeartbeatFailure,
@@ -127,6 +205,65 @@ mod tests {
     fn no_failures_means_healthy() {
         let monitor = HealthMonitor::new();
         assert_eq!(monitor.current_state(), SystemState::Healthy);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_check_clears_the_failure_on_success() {
+        let monitor = HealthMonitor::new();
+        monitor.report_failure(HealthCheckFailure::BrokerHeartbeatFailure);
+
+        let result: Result<u32, HeartbeatError<String>> = check_broker_heartbeat(
+            &monitor,
+            std::time::Duration::from_secs(1),
+            async { Ok::<u32, String>(42) },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(monitor.current_state(), SystemState::Healthy);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_check_reports_failure_when_the_call_errors() {
+        let monitor = HealthMonitor::new();
+        let result: Result<u32, HeartbeatError<String>> = check_broker_heartbeat(
+            &monitor,
+            std::time::Duration::from_secs(1),
+            async { Err::<u32, String>("boom".to_string()) },
+        )
+        .await;
+
+        assert!(matches!(result, Err(HeartbeatError::CallFailed(_))));
+        assert_eq!(monitor.current_state(), SystemState::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_check_reports_failure_on_timeout_without_panicking() {
+        let monitor = HealthMonitor::new();
+        let result: Result<u32, HeartbeatError<String>> = check_broker_heartbeat(
+            &monitor,
+            std::time::Duration::from_millis(10),
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok::<u32, String>(42)
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(HeartbeatError::TimedOut(_))));
+        assert_eq!(monitor.current_state(), SystemState::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn resident_memory_reports_something_plausible_on_linux() {
+        // This sandbox runs Linux, same as the real deployment target
+        // (GitHub Actions' ubuntu-latest), so this should always resolve
+        // to Some(...) here; a non-Linux environment would see None,
+        // which the function is documented to degrade to gracefully
+        // rather than error.
+        let mb = resident_memory_mb().await;
+        assert!(mb.is_some());
+        assert!(mb.unwrap() > 0);
     }
 
     #[test]
