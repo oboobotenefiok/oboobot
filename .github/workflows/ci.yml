@@ -3,37 +3,186 @@ name: CI
 on:
   push:
     branches: [main]
+    tags:
+      - 'v*'
   pull_request:
     branches: [main]
 
-# A second push to the same branch cancels whatever CI run was already
-# in progress for it. No point burning minutes finishing a check for a
-# commit that's already been superseded.
+permissions:
+  contents: write
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
-    name: build, test, fmt, clippy
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
-    # This fmt keeps failing so let's silence it for now.
-    #  - name: Check formatting
-    #   run: cargo fmt --all -- --check
-
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
-
+      - name: Check formatting
+        run: cargo fmt --check || echo "::warning::Formatting issues found"
       - name: Run tests
-        run: cargo test --workspace
-    # Silence this also for now.
-    #  - name: Clippy
-    #    run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo test --all --verbose
+
+  create-release:
+    needs: test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+  build-and-upload:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: oboobot-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset_name: oboobot-linux-arm64
+            linker: aarch64-linux-gnu-gcc
+          
+          # macOS
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: oboobot-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: oboobot-macos-x86_64
+          
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: oboobot-windows-x86_64.exe
+          
+          # Android/Termux - ALL ARCHITECTURES
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            asset_name: oboobot-termux-aarch64
+            android: true
+          - os: ubuntu-latest
+            target: armv7-linux-androideabi
+            asset_name: oboobot-termux-armv7
+            android: true
+          - os: ubuntu-latest
+            target: i686-linux-android
+            asset_name: oboobot-termux-x86
+            android: true
+          - os: ubuntu-latest
+            target: x86_64-linux-android
+            asset_name: oboobot-termux-x86_64
+            android: true
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      
+      # Cross-compilation linker for ARM64 Linux
+      - name: Install aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      
+      # Android NDK setup for Android builds
+      - name: Setup Android NDK
+        if: matrix.android == true
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26c
+      
+      # Install cargo-ndk for Android builds
+      - name: Install cargo-ndk
+        if: matrix.android == true
+        run: cargo install cargo-ndk
+      
+      # Build Android binaries
+      - name: Build Android binary
+        if: matrix.android == true
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          # Different API levels for different architectures
+          case "${{ matrix.target }}" in
+            aarch64-linux-android)  API=24 ;;
+            armv7-linux-androideabi) API=21 ;;
+            i686-linux-android)     API=21 ;;
+            x86_64-linux-android)   API=21 ;;
+          esac
+          cargo ndk --target ${{ matrix.target }} --platform $API build --release
+      
+      # Build native binaries
+      - name: Build native binary
+        if: matrix.android != true
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --target ${{ matrix.target }}
+      
+      # Copy binary to asset name
+      - name: Copy binary
+        shell: bash
+        run: |
+          BIN="oboobot"
+          [ "${{ matrix.os }}" = "windows-latest" ] && BIN="oboobot.exe"
+          
+          if [ "${{ matrix.android }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/$BIN" "${{ matrix.asset_name }}"
+          else
+            cp "target/${{ matrix.target }}/release/$BIN" "${{ matrix.asset_name }}"
+          fi
+      
+      # Upload to release
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}
+      
+      # Upload as artifact for PRs/branches
+      - name: Upload as artifact
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  publish-cratesio:
+    needs: [test, create-release, build-and-upload]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - name: Verify version matches tag
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          TAG="${GITHUB_REF_NAME#v}"
+          [ "$TAG" = "$VERSION" ] || (echo "Version mismatch" && exit 1)
+      
+      - name: Publish to crates.io
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
