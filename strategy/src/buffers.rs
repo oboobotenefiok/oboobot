@@ -31,7 +31,11 @@ pub struct RollingBuffer {
 
 impl RollingBuffer {
     pub fn start(price: Decimal, resets_at: DateTime<Utc>) -> Self {
-        RollingBuffer { high: price, low: price, resets_at }
+        RollingBuffer {
+            high: price,
+            low: price,
+            resets_at,
+        }
     }
 
     /// Widen the buffer to include a newly observed price. Does nothing
@@ -51,7 +55,10 @@ impl RollingBuffer {
     }
 
     pub fn as_buffer_levels(&self) -> BufferLevels {
-        BufferLevels { low: self.low, high: self.high }
+        BufferLevels {
+            low: self.low,
+            high: self.high,
+        }
     }
 }
 

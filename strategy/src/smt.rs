@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn no_divergence_when_both_assets_move_together() {
         let inputs = DivergenceInputs {
-            primary_price: dec!(1.0990), // below primary low
+            primary_price: dec!(1.0990),   // below primary low
             secondary_price: dec!(1.0990), // also below its own low: confirmed, not diverging
             daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
@@ -221,14 +221,17 @@ mod tests {
     #[test]
     fn primary_sweeps_low_secondary_holds_so_secondary_is_bought() {
         let inputs = DivergenceInputs {
-            primary_price: dec!(1.0990), // sweeps daily low
+            primary_price: dec!(1.0990),   // sweeps daily low
             secondary_price: dec!(1.1010), // holds daily low
             daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)), // wide enough not to trigger
             session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Buy, Tier::Tier1)));
+        assert_eq!(
+            evaluate_smt(&inputs),
+            Some((TradeTarget::Secondary, Direction::Buy, Tier::Tier1))
+        );
     }
 
     #[test]
@@ -238,40 +241,49 @@ mod tests {
         // used to fall through this function's checks entirely before
         // they covered both directions.
         let inputs = DivergenceInputs {
-            primary_price: dec!(1.1010), // holds daily low
+            primary_price: dec!(1.1010),   // holds daily low
             secondary_price: dec!(1.0990), // sweeps daily low
             daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
             session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Primary, Direction::Buy, Tier::Tier1)));
+        assert_eq!(
+            evaluate_smt(&inputs),
+            Some((TradeTarget::Primary, Direction::Buy, Tier::Tier1))
+        );
     }
 
     #[test]
     fn primary_sweeps_high_secondary_holds_so_secondary_is_sold() {
         let inputs = DivergenceInputs {
-            primary_price: dec!(1.1110), // sweeps daily high
+            primary_price: dec!(1.1110),   // sweeps daily high
             secondary_price: dec!(1.1090), // holds daily high
             daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
             session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Sell, Tier::Tier1)));
+        assert_eq!(
+            evaluate_smt(&inputs),
+            Some((TradeTarget::Secondary, Direction::Sell, Tier::Tier1))
+        );
     }
 
     #[test]
     fn secondary_sweeps_high_primary_holds_so_primary_is_sold() {
         let inputs = DivergenceInputs {
-            primary_price: dec!(1.1090), // holds daily high
+            primary_price: dec!(1.1090),   // holds daily high
             secondary_price: dec!(1.1110), // sweeps daily high
             daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
             session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Primary, Direction::Sell, Tier::Tier1)));
+        assert_eq!(
+            evaluate_smt(&inputs),
+            Some((TradeTarget::Primary, Direction::Sell, Tier::Tier1))
+        );
     }
 
     #[test]
@@ -284,7 +296,10 @@ mod tests {
             session_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             session_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Buy, Tier::Double)));
+        assert_eq!(
+            evaluate_smt(&inputs),
+            Some((TradeTarget::Secondary, Direction::Buy, Tier::Double))
+        );
     }
 
     #[test]
@@ -303,7 +318,10 @@ mod tests {
             session_primary_buffer: buffer(dec!(1.0950), dec!(1.1200)), // primary no longer sweeps this
             session_secondary_buffer: buffer(dec!(1.1050), dec!(1.1200)), // secondary sweeps this instead
         };
-        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Buy, Tier::Tier1)));
+        assert_eq!(
+            evaluate_smt(&inputs),
+            Some((TradeTarget::Secondary, Direction::Buy, Tier::Tier1))
+        );
     }
 
     #[test]

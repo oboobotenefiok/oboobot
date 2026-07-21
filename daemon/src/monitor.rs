@@ -39,14 +39,18 @@ pub struct ExitDecision {
 /// `current_price`. `None` if the position has no configured stop or
 /// target, or if neither has been reached yet.
 fn risk_reward_exit(position: &Position, current_price: Decimal) -> Option<ExitReason> {
-    let hit_stop = position.stop_loss.is_some_and(|stop| match position.direction {
-        Direction::Buy => current_price <= stop,
-        Direction::Sell => current_price >= stop,
-    });
-    let hit_target = position.take_profit.is_some_and(|target| match position.direction {
-        Direction::Buy => current_price >= target,
-        Direction::Sell => current_price <= target,
-    });
+    let hit_stop = position
+        .stop_loss
+        .is_some_and(|stop| match position.direction {
+            Direction::Buy => current_price <= stop,
+            Direction::Sell => current_price >= stop,
+        });
+    let hit_target = position
+        .take_profit
+        .is_some_and(|target| match position.direction {
+            Direction::Buy => current_price >= target,
+            Direction::Sell => current_price <= target,
+        });
 
     if hit_stop {
         Some(ExitReason::StopLoss)
@@ -71,7 +75,9 @@ fn smt_contradiction_exit(
     current_divergence: Option<&(String, Direction, Tier)>,
 ) -> Option<ExitReason> {
     match current_divergence {
-        Some((pair, direction, _)) if *pair == position.pair && *direction != position.direction => {
+        Some((pair, direction, _))
+            if *pair == position.pair && *direction != position.direction =>
+        {
             Some(ExitReason::Contradiction)
         }
         _ => None,
@@ -116,7 +122,10 @@ pub fn evaluate_exits(
                 smt_contradiction_exit(position, current_divergence.as_ref())
             };
 
-            reason.map(|reason| ExitDecision { position_id: position.position_id, reason })
+            reason.map(|reason| ExitDecision {
+                position_id: position.position_id,
+                reason,
+            })
         })
         .collect()
 }
@@ -161,7 +170,14 @@ mod tests {
         use rust_decimal_macros::dec;
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
-        let decisions = evaluate_exits(&[position.clone()], &prices(dec!(1.0940)), &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(
+            &[position.clone()],
+            &prices(dec!(1.0940)),
+            &[],
+            now,
+            Duration::minutes(15),
+            None,
+        );
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].reason, ExitReason::StopLoss);
     }
@@ -171,7 +187,14 @@ mod tests {
         use rust_decimal_macros::dec;
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
-        let decisions = evaluate_exits(&[position.clone()], &prices(dec!(1.1160)), &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(
+            &[position.clone()],
+            &prices(dec!(1.1160)),
+            &[],
+            now,
+            Duration::minutes(15),
+            None,
+        );
         assert_eq!(decisions[0].reason, ExitReason::TakeProfit);
     }
 
@@ -181,10 +204,24 @@ mod tests {
         let position = sample_position(Direction::Sell, dec!(1.1050), dec!(1.0850));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
 
-        let stopped = evaluate_exits(&[position.clone()], &prices(dec!(1.1060)), &[], now, Duration::minutes(15), None);
+        let stopped = evaluate_exits(
+            &[position.clone()],
+            &prices(dec!(1.1060)),
+            &[],
+            now,
+            Duration::minutes(15),
+            None,
+        );
         assert_eq!(stopped[0].reason, ExitReason::StopLoss);
 
-        let targeted = evaluate_exits(&[position.clone()], &prices(dec!(1.0840)), &[], now, Duration::minutes(15), None);
+        let targeted = evaluate_exits(
+            &[position.clone()],
+            &prices(dec!(1.0840)),
+            &[],
+            now,
+            Duration::minutes(15),
+            None,
+        );
         assert_eq!(targeted[0].reason, ExitReason::TakeProfit);
     }
 
@@ -193,7 +230,14 @@ mod tests {
         use rust_decimal_macros::dec;
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
-        let decisions = evaluate_exits(&[position], &prices(dec!(1.1000)), &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(
+            &[position],
+            &prices(dec!(1.1000)),
+            &[],
+            now,
+            Duration::minutes(15),
+            None,
+        );
         assert!(decisions.is_empty());
     }
 
@@ -207,7 +251,14 @@ mod tests {
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         let empty_prices = BTreeMap::new();
-        let decisions = evaluate_exits(&[position], &empty_prices, &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(
+            &[position],
+            &empty_prices,
+            &[],
+            now,
+            Duration::minutes(15),
+            None,
+        );
         assert!(decisions.is_empty());
     }
 
@@ -277,7 +328,14 @@ mod tests {
             forecast: None,
             previous: None,
         }];
-        let decisions = evaluate_exits(&[position], &prices(dec!(1.0940)), &events, now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(
+            &[position],
+            &prices(dec!(1.0940)),
+            &events,
+            now,
+            Duration::minutes(15),
+            None,
+        );
         // Price also hit the stop loss; that should win over the news
         // exit that would otherwise also apply, since it's checked first.
         assert_eq!(decisions[0].reason, ExitReason::StopLoss);

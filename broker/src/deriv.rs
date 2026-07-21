@@ -45,6 +45,12 @@ use crate::adapter::BrokerError;
 
 const DERIV_WS_URL: &str = "wss://ws.derivws.com/websockets/v3";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// The two Multiplier contract types this daemon ever trades. Named here
+// once so submit_order (Direction -> contract type) and
+// direction_from_contract_type (contract type -> Direction) read off
+// the same source of truth instead of each hardcoding the strings.
+const MULTIPLIER_CONTRACT_TYPE_BUY: &str = "MULTUP";
+const MULTIPLIER_CONTRACT_TYPE_SELL: &str = "MULTDOWN";
 
 /// `EURUSD` -> `frxEURUSD`. Confirmed against Deriv's current docs and
 /// several dated (2025) working examples; forex pairs all take this
@@ -52,6 +58,28 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// this daemon doesn't target.
 fn to_deriv_symbol(pair: &str) -> String {
     format!("frx{pair}")
+}
+
+/// `frxEURUSD` -> `Some("EURUSD")`, the inverse of `to_deriv_symbol`.
+/// `None` for anything that doesn't carry the `frx` prefix this daemon
+/// always uses for the pairs it trades: a portfolio contract without it
+/// wasn't opened by this bot (a synthetic index, a manually-placed
+/// trade, one of Deriv's other product lines sharing the same account)
+/// and shouldn't be force-fit into a `Position` it doesn't describe.
+fn from_deriv_symbol(symbol: &str) -> Option<&str> {
+    symbol.strip_prefix("frx")
+}
+
+/// `MULTUP`/`MULTDOWN` -> `Direction`. `None` for anything else, on the
+/// same reasoning as `from_deriv_symbol`: this daemon's `submit_order`
+/// only ever opens these two contract types, so a portfolio contract
+/// reporting any other type wasn't opened by this bot.
+fn direction_from_contract_type(contract_type: &str) -> Option<domain::Direction> {
+    match contract_type {
+        MULTIPLIER_CONTRACT_TYPE_BUY => Some(domain::Direction::Buy),
+        MULTIPLIER_CONTRACT_TYPE_SELL => Some(domain::Direction::Sell),
+        _ => None,
+    }
 }
 
 struct PendingRequests {
@@ -84,13 +112,11 @@ impl DerivClient {
     pub async fn connect(app_id: &str) -> Result<Self, BrokerError> {
         let url = format!("{DERIV_WS_URL}?app_id={app_id}");
 
-        let (ws_stream, _response) = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            tokio_tungstenite::connect_async(&url),
-        )
-        .await
-        .map_err(|_| BrokerError::Timeout(REQUEST_TIMEOUT.as_millis() as u64))?
-        .map_err(|e| BrokerError::ConnectionFailed(e.to_string()))?;
+        let (ws_stream, _response) =
+            tokio::time::timeout(REQUEST_TIMEOUT, tokio_tungstenite::connect_async(&url))
+                .await
+                .map_err(|_| BrokerError::Timeout(REQUEST_TIMEOUT.as_millis() as u64))?
+                .map_err(|e| BrokerError::ConnectionFailed(e.to_string()))?;
 
         let (write, mut read) = ws_stream.split();
         let pending = Arc::new(PendingRequests {
@@ -157,13 +183,18 @@ impl DerivClient {
             return Err(BrokerError::ConnectionFailed(e.to_string()));
         }
 
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, rx).await.map_err(|_| {
-            self.pending.inner.lock().remove(&req_id);
-            BrokerError::Timeout(REQUEST_TIMEOUT.as_millis() as u64)
-        })?;
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, rx)
+            .await
+            .map_err(|_| {
+                self.pending.inner.lock().remove(&req_id);
+                BrokerError::Timeout(REQUEST_TIMEOUT.as_millis() as u64)
+            })?;
 
-        let response = response
-            .map_err(|_| BrokerError::ConnectionFailed("response channel closed before a reply arrived".to_string()))?;
+        let response = response.map_err(|_| {
+            BrokerError::ConnectionFailed(
+                "response channel closed before a reply arrived".to_string(),
+            )
+        })?;
 
         if let Some(error) = response.get("error") {
             let message = error
@@ -220,18 +251,146 @@ impl DerivAdapter {
             .get("tick")
             .and_then(|t| t.get("quote"))
             .and_then(Value::as_f64)
-            .ok_or_else(|| BrokerError::MalformedResponse(format!("no usable quote in tick response for {symbol}")))?;
-        rust_decimal::Decimal::try_from(quote)
-            .map_err(|_| BrokerError::MalformedResponse(format!("quote for {symbol} was not a finite number")))
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse(format!(
+                    "no usable quote in tick response for {symbol}"
+                ))
+            })?;
+        rust_decimal::Decimal::try_from(quote).map_err(|_| {
+            BrokerError::MalformedResponse(format!("quote for {symbol} was not a finite number"))
+        })
+    }
+
+    /// Builds one open `Position` from Deriv's `proposal_open_contract`,
+    /// the only call that carries live price, running profit, and
+    /// stop-loss/take-profit levels; `portfolio` alone only lists
+    /// contract ids and a handful of static fields. Returns `Ok(None)`
+    /// rather than a stale `Position` if the contract has already
+    /// closed by the time this call lands: `portfolio` and
+    /// `proposal_open_contract` aren't one atomic snapshot, so a
+    /// contract hitting its own stop or target (or expiring) in the gap
+    /// between them is a real race, not a bug, and the next cycle's
+    /// reconciliation will simply stop seeing it here once it's gone.
+    async fn fetch_open_position(
+        &self,
+        contract_id: u64,
+        pair: String,
+        direction: domain::Direction,
+    ) -> Result<Option<domain::Position>, BrokerError> {
+        let response = self
+            .client
+            .call(json!({ "proposal_open_contract": 1, "contract_id": contract_id }))
+            .await?;
+        let detail = response.get("proposal_open_contract").ok_or_else(|| {
+            BrokerError::MalformedResponse(
+                "proposal_open_contract response had no usable proposal_open_contract field"
+                    .to_string(),
+            )
+        })?;
+
+        let is_sold = detail.get("is_sold").and_then(Value::as_i64).unwrap_or(0);
+        if is_sold != 0 {
+            return Ok(None);
+        }
+
+        let decimal_field = |field: &str| -> Result<rust_decimal::Decimal, BrokerError> {
+            detail
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrokerError::MalformedResponse(format!(
+                        "proposal_open_contract had no usable {field}"
+                    ))
+                })?
+                .parse::<rust_decimal::Decimal>()
+                .map_err(|_| {
+                    BrokerError::MalformedResponse(format!("{field} was not a valid decimal"))
+                })
+        };
+
+        let entry_price = decimal_field("buy_price")?;
+        let current_price = decimal_field("bid_price")?;
+        // Deriv already computes this as bid_price - buy_price for us;
+        // trusting its own figure here keeps this in agreement with
+        // whatever Deriv itself would show, rather than risking a
+        // rounding mismatch from recomputing it independently.
+        let unrealized_pnl = decimal_field("profit")?;
+
+        let purchase_time = detail
+            .get("purchase_time")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse(
+                    "proposal_open_contract had no usable purchase_time".to_string(),
+                )
+            })?;
+        let entry_time = chrono::DateTime::from_timestamp(purchase_time, 0).ok_or_else(|| {
+            BrokerError::MalformedResponse(
+                "purchase_time was not a valid unix timestamp".to_string(),
+            )
+        })?;
+
+        // stop_loss/take_profit are optional on a Multiplier contract,
+        // and Deriv omits `limit_order` (or either side of it) entirely
+        // when they weren't set, rather than sending a null placeholder,
+        // so this stays an Option all the way through rather than
+        // treating a missing barrier as a malformed response.
+        let barrier = |side: &str| -> Option<rust_decimal::Decimal> {
+            detail
+                .get("limit_order")?
+                .get(side)?
+                .get("value")?
+                .as_str()?
+                .parse::<rust_decimal::Decimal>()
+                .ok()
+        };
+
+        Ok(Some(domain::Position {
+            // Deriv's contract_id becomes our position_id the same way
+            // submit_order and close_position already encode it, so a
+            // position discovered here reconciles correctly against one
+            // this daemon opened and already knows under the same id.
+            position_id: uuid::Uuid::from_u128(contract_id as u128),
+            // Deriv's responses carry no equivalent of this daemon's
+            // internal trace_id/signal_id; those only exist on our side,
+            // from the signal that led to the original order. Fresh ids
+            // here are the same honest gap close_position's own comment
+            // documents for the same reason, not a guess at the real
+            // ones: a caller that needs them should already have them
+            // from when the position was opened.
+            trace_id: uuid::Uuid::new_v4(),
+            signal_id: uuid::Uuid::new_v4(),
+            pair,
+            direction,
+            // A Multiplier contract fills atomically at open; there's no
+            // partial-fill history the way a traditional forex order can
+            // have, so one leg is the whole fill history there is. Its
+            // size matches submit_order's own convention for this
+            // adapter, where "size" means the dollar stake, which for a
+            // Multiplier bought at basis=stake is buy_price itself: the
+            // same number as entry_price.
+            legs: vec![domain::FillLeg {
+                price: entry_price,
+                size: entry_price,
+                filled_at: entry_time,
+            }],
+            entry_price,
+            current_price,
+            unrealized_pnl,
+            realized_pnl: rust_decimal::Decimal::ZERO,
+            entry_time,
+            last_update: chrono::Utc::now(),
+            status: domain::PositionStatus::Filled,
+            exit_reason: None,
+            stop_loss: barrier("stop_loss"),
+            take_profit: barrier("take_profit"),
+        }))
     }
 }
 
 #[async_trait::async_trait]
 impl crate::adapter::BrokerAdapter for DerivAdapter {
-    async fn get_snapshot(
-        &self,
-        pairs: &[String],
-    ) -> Result<domain::BrokerSnapshot, BrokerError> {
+    async fn get_snapshot(&self, pairs: &[String]) -> Result<domain::BrokerSnapshot, BrokerError> {
         let mut prices = std::collections::BTreeMap::new();
         let mut spreads = std::collections::BTreeMap::new();
 
@@ -244,7 +403,13 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
             // a hidden assumption, and is fine for a strategy that reads
             // spread from `spreads` directly rather than from bid-ask
             // width when the source doesn't provide one.
-            prices.insert(pair.clone(), domain::PriceQuote { bid: quote, ask: quote });
+            prices.insert(
+                pair.clone(),
+                domain::PriceQuote {
+                    bid: quote,
+                    ask: quote,
+                },
+            );
             spreads.insert(pair.clone(), rust_decimal::Decimal::ZERO);
         }
 
@@ -262,8 +427,8 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
     ) -> Result<domain::Order, BrokerError> {
         let symbol = to_deriv_symbol(&request.pair);
         let contract_type = match request.side {
-            domain::Direction::Buy => "MULTUP",
-            domain::Direction::Sell => "MULTDOWN",
+            domain::Direction::Buy => MULTIPLIER_CONTRACT_TYPE_BUY,
+            domain::Direction::Sell => MULTIPLIER_CONTRACT_TYPE_SELL,
         };
 
         // Deriv's real trading primitive is stake + multiplier, not a
@@ -298,12 +463,18 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
             .get("proposal")
             .and_then(|p| p.get("id"))
             .and_then(Value::as_str)
-            .ok_or_else(|| BrokerError::MalformedResponse("proposal response had no usable id".to_string()))?;
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse("proposal response had no usable id".to_string())
+            })?;
         let ask_price = proposal
             .get("proposal")
             .and_then(|p| p.get("ask_price"))
             .and_then(Value::as_f64)
-            .ok_or_else(|| BrokerError::MalformedResponse("proposal response had no usable ask_price".to_string()))?;
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse(
+                    "proposal response had no usable ask_price".to_string(),
+                )
+            })?;
 
         let buy_response = self
             .client
@@ -314,14 +485,17 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
             .get("buy")
             .and_then(|b| b.get("contract_id"))
             .and_then(Value::as_u64)
-            .ok_or_else(|| BrokerError::MalformedResponse("buy response had no usable contract_id".to_string()))?;
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse("buy response had no usable contract_id".to_string())
+            })?;
         let buy_price = buy_response
             .get("buy")
             .and_then(|b| b.get("buy_price"))
             .and_then(Value::as_f64)
             .unwrap_or(ask_price);
-        let fill_price = rust_decimal::Decimal::try_from(buy_price)
-            .map_err(|_| BrokerError::MalformedResponse("buy_price was not a finite number".to_string()))?;
+        let fill_price = rust_decimal::Decimal::try_from(buy_price).map_err(|_| {
+            BrokerError::MalformedResponse("buy_price was not a finite number".to_string())
+        })?;
 
         Ok(domain::Order {
             order_id: request.order_id,
@@ -349,7 +523,8 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
         // this stays NotImplemented rather than being force-fit into a
         // shape Deriv's model doesn't actually have.
         Err(BrokerError::NotImplemented(
-            "DerivAdapter::cancel_order — Multipliers don't have a pending-order concept to cancel".to_string(),
+            "DerivAdapter::cancel_order — Multipliers don't have a pending-order concept to cancel"
+                .to_string(),
         ))
     }
 
@@ -364,15 +539,18 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
             .call(json!({ "sell": contract_id, "price": 0 }))
             .await?;
 
-        let sold = response
-            .get("sell")
-            .ok_or_else(|| BrokerError::MalformedResponse("sell response had no usable sell field".to_string()))?;
+        let sold = response.get("sell").ok_or_else(|| {
+            BrokerError::MalformedResponse("sell response had no usable sell field".to_string())
+        })?;
         let sold_for = sold
             .get("sold_for")
             .and_then(Value::as_f64)
-            .ok_or_else(|| BrokerError::MalformedResponse("sell response had no usable sold_for".to_string()))?;
-        let price = rust_decimal::Decimal::try_from(sold_for)
-            .map_err(|_| BrokerError::MalformedResponse("sold_for was not a finite number".to_string()))?;
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse("sell response had no usable sold_for".to_string())
+            })?;
+        let price = rust_decimal::Decimal::try_from(sold_for).map_err(|_| {
+            BrokerError::MalformedResponse("sold_for was not a finite number".to_string())
+        })?;
 
         // Deriv's sell response doesn't carry the original pair, size,
         // trace_id, or signal_id, and this adapter doesn't maintain a
@@ -405,29 +583,92 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
             .get("balance")
             .and_then(|b| b.get("balance"))
             .and_then(Value::as_f64)
-            .ok_or_else(|| BrokerError::MalformedResponse("balance response had no usable balance field".to_string()))?;
-        let decimal = rust_decimal::Decimal::try_from(balance)
-            .map_err(|_| BrokerError::MalformedResponse("balance was not a finite number".to_string()))?;
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse(
+                    "balance response had no usable balance field".to_string(),
+                )
+            })?;
+        let decimal = rust_decimal::Decimal::try_from(balance).map_err(|_| {
+            BrokerError::MalformedResponse("balance was not a finite number".to_string())
+        })?;
         Ok(domain::Usd::from_decimal(decimal))
     }
 
+    /// Lists every currently open contract on the account that this
+    /// daemon's own `submit_order` could have opened: a forex Multiplier
+    /// (MULTUP/MULTDOWN) on one of the `frx`-prefixed symbols this
+    /// daemon trades. `portfolio` gives the list of open contract ids;
+    /// `fetch_open_position` then fills in the rest per contract, since
+    /// portfolio alone doesn't carry live price, running profit, or
+    /// stop-loss/take-profit levels. A contract the account holds but
+    /// this daemon didn't open (a synthetic index, a manual trade on the
+    /// same account, some other Deriv product) is skipped rather than
+    /// force-fit into a `Position` it doesn't actually describe.
     async fn list_open_positions(&self) -> Result<Vec<domain::Position>, BrokerError> {
-        // Deriv's portfolio call returns open contracts with less detail
-        // than proposal_open_contract does per-contract; reconciliation
-        // only needs enough here to know *that* a contract is open and
-        // its id, not full fill-leg history, so this intentionally
-        // returns a minimal Position per open contract rather than
-        // reconstructing one to the same fidelity a broker with real
-        // fill-leg reporting would allow.
-        Err(BrokerError::NotImplemented(
-            "DerivAdapter::list_open_positions — portfolio parsing not yet built".to_string(),
-        ))
+        let portfolio = self.client.call(json!({ "portfolio": 1 })).await?;
+        let contracts = portfolio
+            .get("portfolio")
+            .and_then(|p| p.get("contracts"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse(
+                    "portfolio response had no usable contracts array".to_string(),
+                )
+            })?;
+
+        let mut positions = Vec::with_capacity(contracts.len());
+        for contract in contracts {
+            let contract_id = contract
+                .get("contract_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    BrokerError::MalformedResponse(
+                        "portfolio contract had no usable contract_id".to_string(),
+                    )
+                })?;
+            let underlying_symbol = contract
+                .get("underlying_symbol")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let contract_type = contract
+                .get("contract_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let (Some(pair), Some(direction)) = (
+                from_deriv_symbol(underlying_symbol),
+                direction_from_contract_type(contract_type),
+            ) else {
+                tracing::debug!(
+                    contract_id,
+                    underlying_symbol,
+                    contract_type,
+                    "skipping a portfolio contract this daemon didn't open"
+                );
+                continue;
+            };
+
+            if let Some(position) = self
+                .fetch_open_position(contract_id, pair.to_string(), direction)
+                .await?
+            {
+                positions.push(position);
+            }
+        }
+
+        Ok(positions)
     }
 
+    /// Always empty, and not a stub: a Deriv Multiplier's `buy` call
+    /// either fills the contract synchronously or gets rejected outright
+    /// by the `proposal`/`buy` pair `submit_order` sends, so there's
+    /// never a resting, pending order in between the way a traditional
+    /// forex limit order has one. That's the same product-model fact
+    /// `cancel_order` above is about; an always-empty `Vec` is the
+    /// honest, correct answer here, not a placeholder for work still to
+    /// do.
     async fn list_open_orders(&self) -> Result<Vec<domain::Order>, BrokerError> {
-        Err(BrokerError::NotImplemented(
-            "DerivAdapter::list_open_orders — Multipliers contracts don't have a separate open-orders concept the way traditional forex brokers do; this needs its own design, not a direct port".to_string(),
-        ))
+        Ok(Vec::new())
     }
 
     fn capabilities(&self) -> crate::adapter::BrokerCapabilities {
@@ -460,6 +701,42 @@ mod tests {
     fn symbol_mapping_adds_the_frx_prefix() {
         assert_eq!(to_deriv_symbol("EURUSD"), "frxEURUSD");
         assert_eq!(to_deriv_symbol("GBPUSD"), "frxGBPUSD");
+    }
+
+    #[test]
+    fn symbol_mapping_strips_the_frx_prefix_back_off() {
+        assert_eq!(from_deriv_symbol("frxEURUSD"), Some("EURUSD"));
+        assert_eq!(from_deriv_symbol("frxGBPUSD"), Some("GBPUSD"));
+    }
+
+    #[test]
+    fn symbol_without_the_frx_prefix_is_not_this_daemons_contract() {
+        // Synthetic indices (R_100), and anything else without the frx
+        // prefix, aren't a symbol this daemon's own submit_order would
+        // ever have opened, so they should be rejected, not guessed at.
+        assert_eq!(from_deriv_symbol("R_100"), None);
+        assert_eq!(from_deriv_symbol(""), None);
+    }
+
+    #[test]
+    fn contract_type_maps_to_the_matching_direction() {
+        assert_eq!(
+            direction_from_contract_type("MULTUP"),
+            Some(domain::Direction::Buy)
+        );
+        assert_eq!(
+            direction_from_contract_type("MULTDOWN"),
+            Some(domain::Direction::Sell)
+        );
+    }
+
+    #[test]
+    fn unrecognized_contract_type_maps_to_none() {
+        // CALL/PUT and every other contract type Deriv supports aren't
+        // ones this daemon's submit_order ever opens, so a portfolio
+        // entry reporting one wasn't opened by this bot.
+        assert_eq!(direction_from_contract_type("CALL"), None);
+        assert_eq!(direction_from_contract_type(""), None);
     }
 
     #[test]

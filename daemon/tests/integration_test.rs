@@ -7,7 +7,9 @@
 //! hands to the next one.
 
 use broker::{BrokerAdapter, MockBroker};
-use daemon::{allows_new_entries, apply_reconciliation, reconcile, HealthCheckFailure, HealthMonitor};
+use daemon::{
+    allows_new_entries, apply_reconciliation, reconcile, HealthCheckFailure, HealthMonitor,
+};
 use domain::{Bias, Direction, OrderRequest, OrderType, Percent, Position, Tier, Usd};
 use risk::RiskEngine as _;
 use rust_decimal_macros::dec;
@@ -31,10 +33,22 @@ async fn a_full_cycle_goes_from_divergence_to_an_open_broker_position() {
     let inputs = DivergenceInputs {
         primary_price: dec!(1.09900),
         secondary_price: dec!(1.10100),
-        daily_primary_buffer: BufferLevels { low: dec!(1.10000), high: dec!(1.10500) },
-        daily_secondary_buffer: BufferLevels { low: dec!(1.10000), high: dec!(1.10500) },
-        session_primary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
-        session_secondary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
+        daily_primary_buffer: BufferLevels {
+            low: dec!(1.10000),
+            high: dec!(1.10500),
+        },
+        daily_secondary_buffer: BufferLevels {
+            low: dec!(1.10000),
+            high: dec!(1.10500),
+        },
+        session_primary_buffer: BufferLevels {
+            low: dec!(1.09000),
+            high: dec!(1.11000),
+        },
+        session_secondary_buffer: BufferLevels {
+            low: dec!(1.09000),
+            high: dec!(1.11000),
+        },
     };
 
     let snapshot = broker
@@ -123,10 +137,22 @@ async fn true_open_conflict_rejects_before_any_order_reaches_the_broker() {
     let inputs = DivergenceInputs {
         primary_price: dec!(1.09900),
         secondary_price: dec!(1.10100),
-        daily_primary_buffer: BufferLevels { low: dec!(1.10000), high: dec!(1.10500) },
-        daily_secondary_buffer: BufferLevels { low: dec!(1.10000), high: dec!(1.10500) },
-        session_primary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
-        session_secondary_buffer: BufferLevels { low: dec!(1.09000), high: dec!(1.11000) },
+        daily_primary_buffer: BufferLevels {
+            low: dec!(1.10000),
+            high: dec!(1.10500),
+        },
+        daily_secondary_buffer: BufferLevels {
+            low: dec!(1.10000),
+            high: dec!(1.10500),
+        },
+        session_primary_buffer: BufferLevels {
+            low: dec!(1.09000),
+            high: dec!(1.11000),
+        },
+        session_secondary_buffer: BufferLevels {
+            low: dec!(1.09000),
+            high: dec!(1.11000),
+        },
     };
 
     let snapshot = broker
@@ -157,7 +183,11 @@ async fn true_open_conflict_rejects_before_any_order_reaches_the_broker() {
     // here, before the verification call just below, matters: calling
     // list_open_positions to check the assertion would itself add a
     // second call and make this check meaningless.
-    assert_eq!(broker.how_many_calls(), 1, "only the snapshot call should have reached the broker");
+    assert_eq!(
+        broker.how_many_calls(),
+        1,
+        "only the snapshot call should have reached the broker"
+    );
 
     let open = broker.list_open_positions().await.unwrap();
     assert!(open.is_empty());

@@ -35,7 +35,11 @@ pub struct RegimeShift {
 
 /// Add a fresh (primary, secondary) price pair to the window, dropping
 /// the oldest sample once `MAX_SAMPLES` is exceeded.
-pub fn record_sample(mut state: CorrelationState, primary: Decimal, secondary: Decimal) -> CorrelationState {
+pub fn record_sample(
+    mut state: CorrelationState,
+    primary: Decimal,
+    secondary: Decimal,
+) -> CorrelationState {
     state.samples.push((primary, secondary));
     if state.samples.len() > MAX_SAMPLES {
         state.samples.remove(0);
@@ -97,7 +101,11 @@ pub fn detect_regime_shift(state: &CorrelationState, threshold: f64) -> Option<R
     let deviation = (current - baseline).abs();
 
     if deviation > threshold {
-        Some(RegimeShift { baseline, current, deviation })
+        Some(RegimeShift {
+            baseline,
+            current,
+            deviation,
+        })
     } else {
         None
     }
@@ -163,7 +171,10 @@ mod tests {
 
     #[test]
     fn regime_shift_fires_only_past_the_threshold() {
-        let mut state = CorrelationState { baseline_coefficient: Some(0.9), ..Default::default() };
+        let mut state = CorrelationState {
+            baseline_coefficient: Some(0.9),
+            ..Default::default()
+        };
         for i in 0..10 {
             let price = dec!(1.1000) + Decimal::new(i, 4);
             state = record_sample(state, price, price); // current coefficient ~1.0
