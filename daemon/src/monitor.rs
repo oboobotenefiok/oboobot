@@ -15,10 +15,12 @@
 //!
 //! For a broker with native stop-loss/take-profit enforcement (Deriv's
 //! Multipliers included), the risk-reward check here is a backup, not
-//! the primary mechanism — the broker itself closes the position before
+//! the primary mechanism: the broker itself closes the position before
 //! this ever gets a chance to. It still matters: for a broker without
 //! native enforcement, or if a native SL/TP order is ever rejected or
 //! modified unexpectedly, this is what catches it.
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
 use domain::{Direction, ExitReason, NewsEvent, Position, Tier};
@@ -57,14 +59,21 @@ fn risk_reward_exit(position: &Position, current_price: Decimal) -> Option<ExitR
 
 /// Whether the live SMT divergence now points opposite to the direction
 /// `position` is holding. `current_divergence` is whatever
-/// `strategy::evaluate_smt` returned this cycle for the same pair, if
-/// anything.
+/// `strategy::evaluate_smt` returned this cycle, resolved down to a
+/// concrete pair name by the caller (since a divergence can now name
+/// either the primary or the secondary asset, not always the same one
+/// this position happens to be on). A divergence that names some other
+/// pair than this position's own says nothing about this position, so
+/// it's treated the same as no divergence at all: only a same-pair,
+/// opposite-direction reading counts as a contradiction.
 fn smt_contradiction_exit(
     position: &Position,
-    current_divergence: Option<(Direction, Tier)>,
+    current_divergence: Option<&(String, Direction, Tier)>,
 ) -> Option<ExitReason> {
     match current_divergence {
-        Some((direction, _)) if direction != position.direction => Some(ExitReason::Contradiction),
+        Some((pair, direction, _)) if *pair == position.pair && *direction != position.direction => {
+            Some(ExitReason::Contradiction)
+        }
         _ => None,
     }
 }
@@ -76,25 +85,35 @@ fn smt_contradiction_exit(
 /// them, though since all three lead to the same action (immediate
 /// close) the order only matters for which `ExitReason` gets recorded,
 /// not for what actually happens.
+///
+/// `current_prices` is a pair-name to price lookup rather than one
+/// flat price, since open positions can now legitimately sit on either
+/// the primary or the secondary pair; a position whose pair isn't in
+/// the map simply skips its risk-reward check for this cycle (the news
+/// and SMT-contradiction checks don't need a price at all, and still
+/// run).
 pub fn evaluate_exits(
     positions: &[Position],
-    current_price: Decimal,
+    current_prices: &BTreeMap<String, Decimal>,
     news_events: &[NewsEvent],
     now: DateTime<Utc>,
     news_lead_time: Duration,
-    current_divergence: Option<(Direction, Tier)>,
+    current_divergence: Option<(String, Direction, Tier)>,
 ) -> Vec<ExitDecision> {
     let news_exit_active = should_exit_for_news(news_events, now, news_lead_time);
 
     positions
         .iter()
         .filter_map(|position| {
-            let reason = if let Some(reason) = risk_reward_exit(position, current_price) {
+            let current_price = current_prices.get(&position.pair).copied();
+            let rr_exit = current_price.and_then(|price| risk_reward_exit(position, price));
+
+            let reason = if let Some(reason) = rr_exit {
                 Some(reason)
             } else if news_exit_active {
                 Some(ExitReason::News)
             } else {
-                smt_contradiction_exit(position, current_divergence)
+                smt_contradiction_exit(position, current_divergence.as_ref())
             };
 
             reason.map(|reason| ExitDecision { position_id: position.position_id, reason })
@@ -133,12 +152,16 @@ mod tests {
         }
     }
 
+    fn prices(price: Decimal) -> BTreeMap<String, Decimal> {
+        BTreeMap::from([("EURUSD".to_string(), price)])
+    }
+
     #[test]
     fn buy_position_exits_on_stop_loss() {
         use rust_decimal_macros::dec;
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
-        let decisions = evaluate_exits(&[position.clone()], dec!(1.0940), &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(&[position.clone()], &prices(dec!(1.0940)), &[], now, Duration::minutes(15), None);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].reason, ExitReason::StopLoss);
     }
@@ -148,7 +171,7 @@ mod tests {
         use rust_decimal_macros::dec;
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
-        let decisions = evaluate_exits(&[position.clone()], dec!(1.1160), &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(&[position.clone()], &prices(dec!(1.1160)), &[], now, Duration::minutes(15), None);
         assert_eq!(decisions[0].reason, ExitReason::TakeProfit);
     }
 
@@ -158,10 +181,10 @@ mod tests {
         let position = sample_position(Direction::Sell, dec!(1.1050), dec!(1.0850));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
 
-        let stopped = evaluate_exits(&[position.clone()], dec!(1.1060), &[], now, Duration::minutes(15), None);
+        let stopped = evaluate_exits(&[position.clone()], &prices(dec!(1.1060)), &[], now, Duration::minutes(15), None);
         assert_eq!(stopped[0].reason, ExitReason::StopLoss);
 
-        let targeted = evaluate_exits(&[position.clone()], dec!(1.0840), &[], now, Duration::minutes(15), None);
+        let targeted = evaluate_exits(&[position.clone()], &prices(dec!(1.0840)), &[], now, Duration::minutes(15), None);
         assert_eq!(targeted[0].reason, ExitReason::TakeProfit);
     }
 
@@ -170,7 +193,21 @@ mod tests {
         use rust_decimal_macros::dec;
         let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
-        let decisions = evaluate_exits(&[position], dec!(1.1000), &[], now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(&[position], &prices(dec!(1.1000)), &[], now, Duration::minutes(15), None);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn no_exit_when_this_positions_pair_has_no_live_price_this_cycle() {
+        // The snapshot for this cycle simply doesn't include this
+        // position's pair (an anomalous but non-fatal broker response).
+        // The risk-reward check can't run without a price, but that's
+        // not itself a reason to close anything.
+        use rust_decimal_macros::dec;
+        let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
+        let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
+        let empty_prices = BTreeMap::new();
+        let decisions = evaluate_exits(&[position], &empty_prices, &[], now, Duration::minutes(15), None);
         assert!(decisions.is_empty());
     }
 
@@ -181,11 +218,11 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         let decisions = evaluate_exits(
             &[position],
-            dec!(1.1000),
+            &prices(dec!(1.1000)),
             &[],
             now,
             Duration::minutes(15),
-            Some((Direction::Sell, Tier::Tier1)), // opposite of the Buy position
+            Some(("EURUSD".to_string(), Direction::Sell, Tier::Tier1)), // opposite of the Buy position, same pair
         );
         assert_eq!(decisions[0].reason, ExitReason::Contradiction);
     }
@@ -197,11 +234,30 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         let decisions = evaluate_exits(
             &[position],
-            dec!(1.1000),
+            &prices(dec!(1.1000)),
             &[],
             now,
             Duration::minutes(15),
-            Some((Direction::Buy, Tier::Tier1)), // same direction
+            Some(("EURUSD".to_string(), Direction::Buy, Tier::Tier1)), // same direction, same pair
+        );
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn smt_contradiction_on_a_different_pair_does_not_trigger_exit() {
+        // The divergence this cycle is real, but it's about GBPUSD, not
+        // this EURUSD position. It shouldn't be read as a contradiction
+        // for a position it has nothing to do with.
+        use rust_decimal_macros::dec;
+        let position = sample_position(Direction::Buy, dec!(1.0950), dec!(1.1150));
+        let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
+        let decisions = evaluate_exits(
+            &[position],
+            &prices(dec!(1.1000)),
+            &[],
+            now,
+            Duration::minutes(15),
+            Some(("GBPUSD".to_string(), Direction::Sell, Tier::Tier1)),
         );
         assert!(decisions.is_empty());
     }
@@ -221,7 +277,7 @@ mod tests {
             forecast: None,
             previous: None,
         }];
-        let decisions = evaluate_exits(&[position], dec!(1.0940), &events, now, Duration::minutes(15), None);
+        let decisions = evaluate_exits(&[position], &prices(dec!(1.0940)), &events, now, Duration::minutes(15), None);
         // Price also hit the stop loss; that should win over the news
         // exit that would otherwise also apply, since it's checked first.
         assert_eq!(decisions[0].reason, ExitReason::StopLoss);

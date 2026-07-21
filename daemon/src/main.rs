@@ -20,7 +20,7 @@
 //! pre-news, and SMT-contradiction exits, independent of whether this
 //! invocation is inside an entry window at all.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use broker::{BrokerAdapter, BybitAdapter, DerivAdapter, MockBroker};
 use clap::{Parser, ValueEnum};
@@ -37,7 +37,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use risk::RiskEngine as _;
 use session_time::HolidayProvider;
-use strategy::{generate_signal, BufferLevels, DivergenceInputs, SignalOutcome};
+use strategy::{generate_signal, BufferLevels, DivergenceInputs, SignalOutcome, TradeTarget};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -291,13 +291,26 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     // named in review: a position no longer sits unwatched between the
     // cycle that opened it and whenever the next window happens to be.
     let news_events = news_provider.upcoming_events(now, chrono::Duration::minutes(15)).await;
+    // A position can now be open on either pair, so exits need a price
+    // per pair (not one flat price) and a divergence resolved down to
+    // the concrete pair name it's actually about, not the abstract
+    // primary/secondary role strategy::evaluate_smt reports it against.
+    let current_prices: BTreeMap<String, Decimal> =
+        BTreeMap::from([(primary.clone(), primary_price), (secondary.clone(), secondary_price)]);
+    let current_divergence_for_exits = current_divergence.map(|(target, direction, tier)| {
+        let pair = match target {
+            TradeTarget::Primary => primary.clone(),
+            TradeTarget::Secondary => secondary.clone(),
+        };
+        (pair, direction, tier)
+    });
     let exits = evaluate_exits(
         &open_positions,
-        primary_price,
+        &current_prices,
         &news_events,
         now,
         chrono::Duration::minutes(15),
-        current_divergence,
+        current_divergence_for_exits,
     );
     for exit in &exits {
         match broker.close_position(exit.position_id).await {
@@ -306,8 +319,16 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                 notifier
                     .notify(&format!("oboobot: closed position {} ({:?})", exit.position_id, exit.reason))
                     .await;
+                // Look up which pair the closed position actually was:
+                // exits aren't only ever primary anymore, so the decision
+                // log should say which one this was, not default to primary.
+                let closed_pair = open_positions
+                    .iter()
+                    .find(|p| p.position_id == exit.position_id)
+                    .map(|p| p.pair.clone())
+                    .unwrap_or_else(|| primary.clone());
                 decisions_cursor
-                    .append(&DecisionRecord::new(primary.clone(), "position_closed").with_detail(format!("{:?}", exit.reason)))
+                    .append(&DecisionRecord::new(closed_pair, "position_closed").with_detail(format!("{:?}", exit.reason)))
                     .await?;
             }
             Err(error) => {
@@ -358,13 +379,6 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if already_entered_this_cycle(&primary, &open_positions, now) {
-        tracing::info!("already entered this pair within the current cycle window, skipping");
-        decisions_cursor.append(&DecisionRecord::new(primary.clone(), "collision_skip")).await?;
-        write_status(&status_snap, &open_positions, &health, Some("collision_skip"), false).await;
-        return Ok(());
-    }
-
     let weekly_bias = load_or_capture_bias(
         &weekly_true_open_snap,
         session_time::Timeframe::Weekly,
@@ -389,11 +403,25 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         weekly_bias,
         daily_bias,
         primary.clone(),
+        secondary.clone(),
         snapshot.snapshot_id,
         dec!(0.8),
         dec!(0.8),
         now + chrono::Duration::minutes(20),
     );
+
+    // The collision check needs to know which pair the signal actually
+    // names, which isn't known until generate_signal returns: a
+    // divergence can point at either primary or secondary, so this can
+    // no longer be checked against a hardcoded pair up front.
+    if let SignalOutcome::Signal(ref signal) = outcome {
+        if already_entered_this_cycle(&signal.pair, &open_positions, now) {
+            tracing::info!(pair = %signal.pair, "already entered this pair within the current cycle window, skipping");
+            decisions_cursor.append(&DecisionRecord::new(signal.pair.clone(), "collision_skip")).await?;
+            write_status(&status_snap, &open_positions, &health, Some("collision_skip"), false).await;
+            return Ok(());
+        }
+    }
 
     let last_decision = match outcome {
         SignalOutcome::NoDivergence => {
@@ -425,9 +453,14 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
             };
 
             let equity = broker.get_account_equity().await?;
+            // Fall back to whichever of primary_price/secondary_price
+            // actually matches signal.pair, not always primary_price: a
+            // missing snapshot entry for secondary shouldn't silently
+            // price a secondary-pair entry off primary's number.
+            let fallback_price = if signal.pair == secondary { secondary_price } else { primary_price };
             let entry_price = match signal.direction {
-                Direction::Buy => snapshot.prices.get(&primary).map(|q| q.ask).unwrap_or(primary_price),
-                Direction::Sell => primary_price,
+                Direction::Buy => snapshot.prices.get(&signal.pair).map(|q| q.ask).unwrap_or(fallback_price),
+                Direction::Sell => snapshot.prices.get(&signal.pair).map(|q| q.bid).unwrap_or(fallback_price),
             };
             let stop_loss_price = match signal.direction {
                 Direction::Buy => entry_price - dec!(0.0050),
@@ -456,7 +489,7 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
             if !decision.approved {
                 tracing::info!(reason = ?decision.rejection_reason, "risk engine rejected the signal");
                 decisions_cursor
-                    .append(&DecisionRecord::new(primary.clone(), "risk_rejected").with_detail(decision.rejection_reason.clone().unwrap_or_default()))
+                    .append(&DecisionRecord::new(signal.pair.clone(), "risk_rejected").with_detail(decision.rejection_reason.clone().unwrap_or_default()))
                     .await?;
                 "risk_rejected".to_string()
             } else {
@@ -480,14 +513,14 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                 let order = broker.submit_order(request).await?;
                 tracing::info!(order_id = %order.order_id, status = ?order.status, "order submitted");
                 notifier
-                    .notify(&format!("oboobot: opened {:?} {} (size {})", signal.direction, primary, decision.position_size))
+                    .notify(&format!("oboobot: opened {:?} {} (size {})", signal.direction, signal.pair, decision.position_size))
                     .await;
 
                 open_positions = broker.list_open_positions().await?;
                 for position in &open_positions {
                     positions_cursor.append(position).await?;
                 }
-                decisions_cursor.append(&DecisionRecord::new(primary.clone(), "order_submitted")).await?;
+                decisions_cursor.append(&DecisionRecord::new(signal.pair.clone(), "order_submitted")).await?;
                 "order_submitted".to_string()
             }
         }
@@ -555,6 +588,8 @@ async fn run_demo() -> anyhow::Result<()> {
         &assistant,
         &positions_cursor,
         &mut open_positions,
+        "GBPUSD",
+        "EURUSD",
         DivergenceInputs {
             primary_price: dec!(1.09900),
             secondary_price: dec!(1.10100),
@@ -575,6 +610,8 @@ async fn run_demo() -> anyhow::Result<()> {
         &assistant,
         &positions_cursor,
         &mut open_positions,
+        "GBPUSD",
+        "EURUSD",
         DivergenceInputs {
             primary_price: dec!(1.10050),
             secondary_price: dec!(1.10050),
@@ -595,6 +632,8 @@ async fn run_demo() -> anyhow::Result<()> {
         &assistant,
         &positions_cursor,
         &mut open_positions,
+        "GBPUSD",
+        "EURUSD",
         DivergenceInputs {
             primary_price: dec!(1.09900),
             secondary_price: dec!(1.10100),
@@ -653,6 +692,8 @@ async fn run_cycle(
     assistant: &dyn AssistantEngine,
     cursor: &CursorFile<Position>,
     open_positions: &mut Vec<Position>,
+    primary_pair: &str,
+    secondary_pair: &str,
     inputs: DivergenceInputs,
     weekly_bias: Bias,
     daily_bias: Bias,
@@ -664,7 +705,7 @@ async fn run_cycle(
         return Ok(());
     }
 
-    let snapshot = broker.get_snapshot(&["EURUSD".to_string(), "GBPUSD".to_string()]).await?;
+    let snapshot = broker.get_snapshot(&[primary_pair.to_string(), secondary_pair.to_string()]).await?;
     let macro_cycle_event = EventEnvelope::new(snapshot.timestamp, Event::MacroCycleStarted);
     for recommendation in assistant.analyze_event(&macro_cycle_event).await {
         daemon::assistant::record_recommendation(&recommendation);
@@ -674,7 +715,8 @@ async fn run_cycle(
         &inputs,
         weekly_bias,
         daily_bias,
-        "EURUSD".to_string(),
+        primary_pair.to_string(),
+        secondary_pair.to_string(),
         snapshot.snapshot_id,
         dec!(0.8),
         dec!(0.8),
@@ -709,12 +751,12 @@ async fn run_cycle(
             let entry_price = match signal.direction {
                 Direction::Buy => snapshot
                     .prices
-                    .get("EURUSD")
+                    .get(&signal.pair)
                     .map(|q| q.ask)
                     .unwrap_or(dec!(1.10000)),
                 Direction::Sell => snapshot
                     .prices
-                    .get("EURUSD")
+                    .get(&signal.pair)
                     .map(|q| q.bid)
                     .unwrap_or(dec!(1.10000)),
             };

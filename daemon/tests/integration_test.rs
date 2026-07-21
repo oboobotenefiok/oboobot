@@ -46,6 +46,7 @@ async fn a_full_cycle_goes_from_divergence_to_an_open_broker_position() {
         &inputs,
         Bias::Buy, // weekly agrees
         Bias::Sell,
+        "GBPUSD".to_string(),
         "EURUSD".to_string(),
         snapshot.snapshot_id,
         dec!(0.8),
@@ -57,6 +58,10 @@ async fn a_full_cycle_goes_from_divergence_to_an_open_broker_position() {
         SignalOutcome::Signal(signal) => signal,
         other => panic!("expected a passing signal in this fixture, got {other:?}"),
     };
+    // primary_price sweeps the primary buffer's low while secondary_price
+    // holds its own, so this divergence is about secondary (EURUSD): it's
+    // the one that held, making it the relatively stronger asset to buy.
+    assert_eq!(signal.pair, "EURUSD");
 
     let config = risk::RiskConfig {
         base_risk_percent: Percent::from_percentage(dec!(1.0)),
@@ -136,6 +141,7 @@ async fn true_open_conflict_rejects_before_any_order_reaches_the_broker() {
         &inputs,
         Bias::Sell,
         Bias::Sell,
+        "GBPUSD".to_string(),
         "EURUSD".to_string(),
         snapshot.snapshot_id,
         dec!(0.8),

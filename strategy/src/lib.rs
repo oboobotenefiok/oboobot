@@ -11,5 +11,5 @@ pub use buffers::{update_daily_buffer, update_session_buffer, RollingBuffer, Spr
 pub use correlation::{compute_coefficient, detect_regime_shift, record_sample, CorrelationState, RegimeShift};
 pub use smt::{
     detect_divergence, evaluate_smt, generate_signal, BufferLevels, DivergenceInputs,
-    SignalOutcome,
+    SignalOutcome, TradeTarget,
 };

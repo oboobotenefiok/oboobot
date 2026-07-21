@@ -5,11 +5,24 @@
 //! disagreement is read as smart money divergence, an early hint of a
 //! reversal.
 //!
+//! The rule is symmetric between the two assets: either one can be the
+//! asset that sweeps, and either one can be the asset that holds.
+//! "Primary" and "secondary" here are just the two input slots this
+//! module's functions take; they aren't fixed roles where one asset
+//! always gets traded and the other never does. What decides the trade
+//! is purely which asset swept and which one held. Sweeping the high
+//! while the other holds means the holder is relatively weak (it should
+//! have made a new high too, and didn't), so the holder gets sold.
+//! Sweeping the low while the other holds means the holder is
+//! relatively strong, so the holder gets bought. Put plainly: always buy
+//! the stronger (higher) asset, always sell the weaker (lower) one.
+//!
 //! This module implements that check against two buffer timeframes
 //! (daily and session). When only one timeframe shows the divergence,
-//! that's a Tier 1 or Tier 2 signal; when both agree on direction at
-//! once, that's a Double SMT signal, which is also what triggers the
-//! 2.0x risk multiplier over in the `risk` crate.
+//! that's a Tier 1 or Tier 2 signal; when both agree, on both which
+//! asset to trade and which direction, that's a Double SMT signal,
+//! which is also what triggers the 2.0x risk multiplier over in the
+//! `risk` crate.
 
 use domain::{Bias, Direction, SignalInvalidated, Tier, TradeSignal};
 use rust_decimal::Decimal;
@@ -21,30 +34,59 @@ pub struct BufferLevels {
     pub low: Decimal,
 }
 
-/// A single-timeframe divergence check between a primary asset and its
-/// correlated secondary. Returns the implied trade direction if the
-/// primary swept a buffer level that the secondary failed to confirm,
-/// `None` if there's no divergence on this timeframe.
+/// Which of the two assets a divergence check identified as the one to
+/// trade: the one that held its buffer level while its counterpart
+/// swept past theirs. This only reflects each asset's role in a given
+/// call's `primary_price`/`secondary_price` inputs; it carries no
+/// meaning beyond that, and doesn't favor either asset when there's a
+/// divergence to trade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeTarget {
+    Primary,
+    Secondary,
+}
+
+/// A single-timeframe divergence check between two correlated assets,
+/// checked both ways: `primary` might be the one that sweeps while
+/// `secondary` holds, or the other way around. Returns which asset held
+/// (the one to trade) together with the implied direction, or `None` if
+/// neither swept without the other confirming.
 pub fn detect_divergence(
     primary_price: Decimal,
     primary_buffer: BufferLevels,
     secondary_price: Decimal,
     secondary_buffer: BufferLevels,
-) -> Option<Direction> {
+) -> Option<(TradeTarget, Direction)> {
     let primary_swept_low = primary_price < primary_buffer.low;
-    let secondary_held_low = secondary_price >= secondary_buffer.low;
+    let secondary_swept_low = secondary_price < secondary_buffer.low;
+    let primary_held_low = !primary_swept_low;
+    let secondary_held_low = !secondary_swept_low;
+
     if primary_swept_low && secondary_held_low {
-        // The primary asset broke down through its buffer low, but the
-        // secondary didn't follow. That's read as bullish: the "smart
-        // money" divergence suggests the breakdown isn't real, and price
-        // reverses up.
-        return Some(Direction::Buy);
+        // Primary broke down through its own buffer low, but secondary
+        // didn't follow. Secondary held up, making it the relatively
+        // stronger asset right now, so secondary is what gets bought.
+        return Some((TradeTarget::Secondary, Direction::Buy));
+    }
+    if secondary_swept_low && primary_held_low {
+        // The mirror image of the case above: secondary broke down and
+        // primary held, so this time primary is what gets bought.
+        return Some((TradeTarget::Primary, Direction::Buy));
     }
 
     let primary_swept_high = primary_price > primary_buffer.high;
-    let secondary_held_high = secondary_price <= secondary_buffer.high;
+    let secondary_swept_high = secondary_price > secondary_buffer.high;
+    let primary_held_high = !primary_swept_high;
+    let secondary_held_high = !secondary_swept_high;
+
     if primary_swept_high && secondary_held_high {
-        return Some(Direction::Sell);
+        // Primary swept above its buffer high but secondary didn't
+        // confirm it: secondary is the relatively weaker asset, so
+        // secondary is what gets sold.
+        return Some((TradeTarget::Secondary, Direction::Sell));
+    }
+    if secondary_swept_high && primary_held_high {
+        return Some((TradeTarget::Primary, Direction::Sell));
     }
 
     None
@@ -60,13 +102,14 @@ pub struct DivergenceInputs {
 }
 
 /// Evaluate both timeframes and decide the overall tier. If daily and
-/// session agree on direction, that's `Tier::Double`. If they disagree
-/// (a real possibility, since they're independent checks against
-/// different buffer windows), the daily timeframe's direction wins, on
-/// the reasoning that a higher timeframe's read on divergence should set
-/// the bias when the two disagree, similarly to how the True Open gate
-/// treats Weekly as the tie-breaker over Daily.
-pub fn evaluate_smt(inputs: &DivergenceInputs) -> Option<(Direction, Tier)> {
+/// session agree, both on which asset to trade and on direction, that's
+/// `Tier::Double`. If they disagree (a real possibility, since they're
+/// independent checks against different buffer windows, and could even
+/// point at different assets entirely) the daily timeframe's read wins
+/// outright, on the reasoning that a higher timeframe's read on
+/// divergence should set the bias when the two disagree, similarly to
+/// how the True Open gate treats Weekly as the tie-breaker over Daily.
+pub fn evaluate_smt(inputs: &DivergenceInputs) -> Option<(TradeTarget, Direction, Tier)> {
     let daily = detect_divergence(
         inputs.primary_price,
         inputs.daily_primary_buffer,
@@ -81,9 +124,11 @@ pub fn evaluate_smt(inputs: &DivergenceInputs) -> Option<(Direction, Tier)> {
     );
 
     match (daily, session) {
-        (Some(d1), Some(d2)) if d1 == d2 => Some((d1, Tier::Double)),
-        (Some(d1), _) => Some((d1, Tier::Tier1)),
-        (None, Some(d2)) => Some((d2, Tier::Tier2)),
+        (Some((target1, d1)), Some((target2, d2))) if target1 == target2 && d1 == d2 => {
+            Some((target1, d1, Tier::Double))
+        }
+        (Some((target1, d1)), _) => Some((target1, d1, Tier::Tier1)),
+        (None, Some((target2, d2))) => Some((target2, d2, Tier::Tier2)),
         (None, None) => None,
     }
 }
@@ -98,23 +143,30 @@ pub enum SignalOutcome {
     Rejected(SignalInvalidated),
 }
 
-/// The full pipeline: detect SMT divergence, then run it through the
-/// True Open gate. This is the one function the daemon's event loop
-/// actually calls each macro cycle; everything above is what it's built
-/// from.
+/// The full pipeline: detect SMT divergence, pick whichever of
+/// `primary_pair`/`secondary_pair` the divergence identified as the one
+/// to trade, then run it through the True Open gate. This is the one
+/// function the daemon's event loop actually calls each macro cycle;
+/// everything above is what it's built from.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_signal(
     inputs: &DivergenceInputs,
     weekly_bias: Bias,
     daily_bias: Bias,
-    pair: String,
+    primary_pair: String,
+    secondary_pair: String,
     originating_snapshot_id: Uuid,
     strength: Decimal,
     confidence: Decimal,
     valid_until: chrono::DateTime<chrono::Utc>,
 ) -> SignalOutcome {
-    let Some((direction, tier)) = evaluate_smt(inputs) else {
+    let Some((target, direction, tier)) = evaluate_smt(inputs) else {
         return SignalOutcome::NoDivergence;
+    };
+
+    let pair = match target {
+        TradeTarget::Primary => primary_pair,
+        TradeTarget::Secondary => secondary_pair,
     };
 
     let trace_id = Uuid::new_v4();
@@ -167,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn daily_only_divergence_is_tier_one() {
+    fn primary_sweeps_low_secondary_holds_so_secondary_is_bought() {
         let inputs = DivergenceInputs {
             primary_price: dec!(1.0990), // sweeps daily low
             secondary_price: dec!(1.1010), // holds daily low
@@ -176,11 +228,54 @@ mod tests {
             session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)), // wide enough not to trigger
             session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((Direction::Buy, Tier::Tier1)));
+        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Buy, Tier::Tier1)));
     }
 
     #[test]
-    fn agreement_on_both_timeframes_is_double() {
+    fn secondary_sweeps_low_primary_holds_so_primary_is_bought() {
+        // The mirror image of the case above: this time secondary is the
+        // one that breaks down and primary is the one that holds, which
+        // used to fall through this function's checks entirely before
+        // they covered both directions.
+        let inputs = DivergenceInputs {
+            primary_price: dec!(1.1010), // holds daily low
+            secondary_price: dec!(1.0990), // sweeps daily low
+            daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
+            session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
+        };
+        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Primary, Direction::Buy, Tier::Tier1)));
+    }
+
+    #[test]
+    fn primary_sweeps_high_secondary_holds_so_secondary_is_sold() {
+        let inputs = DivergenceInputs {
+            primary_price: dec!(1.1110), // sweeps daily high
+            secondary_price: dec!(1.1090), // holds daily high
+            daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
+            session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
+        };
+        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Sell, Tier::Tier1)));
+    }
+
+    #[test]
+    fn secondary_sweeps_high_primary_holds_so_primary_is_sold() {
+        let inputs = DivergenceInputs {
+            primary_price: dec!(1.1090), // holds daily high
+            secondary_price: dec!(1.1110), // sweeps daily high
+            daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            session_primary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
+            session_secondary_buffer: buffer(dec!(1.0900), dec!(1.1200)),
+        };
+        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Primary, Direction::Sell, Tier::Tier1)));
+    }
+
+    #[test]
+    fn agreement_on_both_timeframes_and_both_targets_is_double() {
         let inputs = DivergenceInputs {
             primary_price: dec!(1.0990),
             secondary_price: dec!(1.1010),
@@ -189,7 +284,26 @@ mod tests {
             session_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
             session_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
         };
-        assert_eq!(evaluate_smt(&inputs), Some((Direction::Buy, Tier::Double)));
+        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Buy, Tier::Double)));
+    }
+
+    #[test]
+    fn agreeing_direction_but_disagreeing_target_falls_back_to_daily_not_double() {
+        // Daily says "secondary is bought" (secondary holds while
+        // primary sweeps its low). Session, against a much narrower pair
+        // of bands, says "primary is bought" instead: same direction on
+        // both timeframes, but a different asset entirely. The two
+        // timeframes aren't actually agreeing on what to trade, so this
+        // should NOT count as a Double, and daily should win.
+        let inputs = DivergenceInputs {
+            primary_price: dec!(1.0990),
+            secondary_price: dec!(1.1010),
+            daily_primary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            daily_secondary_buffer: buffer(dec!(1.1000), dec!(1.1100)),
+            session_primary_buffer: buffer(dec!(1.0950), dec!(1.1200)), // primary no longer sweeps this
+            session_secondary_buffer: buffer(dec!(1.1050), dec!(1.1200)), // secondary sweeps this instead
+        };
+        assert_eq!(evaluate_smt(&inputs), Some((TradeTarget::Secondary, Direction::Buy, Tier::Tier1)));
     }
 
     #[test]
@@ -207,6 +321,7 @@ mod tests {
             &inputs,
             Bias::Buy, // weekly agrees with the Buy signal
             Bias::Sell,
+            "GBPUSD".to_string(),
             "EURUSD".to_string(),
             Uuid::new_v4(),
             dec!(0.8),
@@ -214,7 +329,15 @@ mod tests {
             chrono::Utc::now(),
         );
 
-        assert!(matches!(outcome, SignalOutcome::Signal(_)));
+        match outcome {
+            // Primary swept its low and secondary held, so this
+            // divergence is about secondary (EURUSD), not primary.
+            SignalOutcome::Signal(signal) => {
+                assert_eq!(signal.pair, "EURUSD");
+                assert_eq!(signal.direction, Direction::Buy);
+            }
+            other => panic!("expected a passing signal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -232,6 +355,7 @@ mod tests {
             &inputs,
             Bias::Sell, // weekly disagrees with the Buy signal
             Bias::Sell,
+            "GBPUSD".to_string(),
             "EURUSD".to_string(),
             Uuid::new_v4(),
             dec!(0.8),
@@ -257,6 +381,7 @@ mod tests {
             &inputs,
             Bias::Buy,
             Bias::Sell,
+            "GBPUSD".to_string(),
             "EURUSD".to_string(),
             Uuid::new_v4(),
             dec!(0.8),
