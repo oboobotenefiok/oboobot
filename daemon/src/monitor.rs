@@ -62,49 +62,45 @@ fn risk_reward_exit(position: &Position, current_price: Decimal) -> Option<ExitR
 }
 
 /// Whether the live SMT divergence now points opposite to the direction
-/// `position` is holding. `current_divergence` is whatever
-/// `strategy::evaluate_smt` returned this cycle, resolved down to a
-/// concrete pair name by the caller (since a divergence can now name
-/// either the primary or the secondary asset, not always the same one
-/// this position happens to be on). A divergence that names some other
-/// pair than this position's own says nothing about this position, so
-/// it's treated the same as no divergence at all: only a same-pair,
-/// opposite-direction reading counts as a contradiction.
+/// `position` is holding. `current_divergences` is a pair name to
+/// (direction, tier) lookup, one entry per pair-set configured this
+/// cycle, since with more than one pair-set active there can be more
+/// than one live divergence reading at once, each about a different
+/// pair. A pair not present in the map (or a divergence about some
+/// other pair than this position's own) says nothing about this
+/// position, so it's treated the same as no divergence at all: only a
+/// same-pair, opposite-direction reading counts as a contradiction.
 fn smt_contradiction_exit(
     position: &Position,
-    current_divergence: Option<&(String, Direction, Tier)>,
+    current_divergences: &BTreeMap<String, (Direction, Tier)>,
 ) -> Option<ExitReason> {
-    match current_divergence {
-        Some((pair, direction, _))
-            if *pair == position.pair && *direction != position.direction =>
-        {
-            Some(ExitReason::Contradiction)
-        }
+    match current_divergences.get(&position.pair) {
+        Some((direction, _)) if *direction != position.direction => Some(ExitReason::Contradiction),
         _ => None,
     }
 }
 
 /// The full exit sweep for one cycle: given every currently open
 /// position, the live price for its pair, whatever news events are on
-/// file, and the live SMT reading (if any), decide which positions
-/// should close and why. Checked in the order the original spec listed
-/// them, though since all three lead to the same action (immediate
-/// close) the order only matters for which `ExitReason` gets recorded,
-/// not for what actually happens.
+/// file, and the live SMT reading for each configured pair-set (if
+/// any), decide which positions should close and why. Checked in the
+/// order the original spec listed them, though since all three lead to
+/// the same action (immediate close) the order only matters for which
+/// `ExitReason` gets recorded, not for what actually happens.
 ///
-/// `current_prices` is a pair-name to price lookup rather than one
-/// flat price, since open positions can now legitimately sit on either
-/// the primary or the secondary pair; a position whose pair isn't in
-/// the map simply skips its risk-reward check for this cycle (the news
-/// and SMT-contradiction checks don't need a price at all, and still
-/// run).
+/// `current_prices` and `current_divergences` are both pair-name keyed
+/// lookups rather than single values, since open positions (and
+/// configured pair-sets) can now span more than one pair; a position
+/// whose pair isn't in `current_prices` simply skips its risk-reward
+/// check for this cycle (the news and SMT-contradiction checks don't
+/// need a price at all, and still run).
 pub fn evaluate_exits(
     positions: &[Position],
     current_prices: &BTreeMap<String, Decimal>,
     news_events: &[NewsEvent],
     now: DateTime<Utc>,
     news_lead_time: Duration,
-    current_divergence: Option<(String, Direction, Tier)>,
+    current_divergences: &BTreeMap<String, (Direction, Tier)>,
 ) -> Vec<ExitDecision> {
     let news_exit_active = should_exit_for_news(news_events, now, news_lead_time);
 
@@ -119,7 +115,7 @@ pub fn evaluate_exits(
             } else if news_exit_active {
                 Some(ExitReason::News)
             } else {
-                smt_contradiction_exit(position, current_divergence.as_ref())
+                smt_contradiction_exit(position, current_divergences)
             };
 
             reason.map(|reason| ExitDecision {
@@ -176,7 +172,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].reason, ExitReason::StopLoss);
@@ -193,7 +189,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         assert_eq!(decisions[0].reason, ExitReason::TakeProfit);
     }
@@ -210,7 +206,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         assert_eq!(stopped[0].reason, ExitReason::StopLoss);
 
@@ -220,7 +216,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         assert_eq!(targeted[0].reason, ExitReason::TakeProfit);
     }
@@ -236,7 +232,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         assert!(decisions.is_empty());
     }
@@ -257,7 +253,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         assert!(decisions.is_empty());
     }
@@ -273,7 +269,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            Some(("EURUSD".to_string(), Direction::Sell, Tier::Tier1)), // opposite of the Buy position, same pair
+            &BTreeMap::from([("EURUSD".to_string(), (Direction::Sell, Tier::Tier1))]), // opposite of the Buy position, same pair
         );
         assert_eq!(decisions[0].reason, ExitReason::Contradiction);
     }
@@ -289,7 +285,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            Some(("EURUSD".to_string(), Direction::Buy, Tier::Tier1)), // same direction, same pair
+            &BTreeMap::from([("EURUSD".to_string(), (Direction::Buy, Tier::Tier1))]), // same direction, same pair
         );
         assert!(decisions.is_empty());
     }
@@ -308,7 +304,7 @@ mod tests {
             &[],
             now,
             Duration::minutes(15),
-            Some(("GBPUSD".to_string(), Direction::Sell, Tier::Tier1)),
+            &BTreeMap::from([("GBPUSD".to_string(), (Direction::Sell, Tier::Tier1))]),
         );
         assert!(decisions.is_empty());
     }
@@ -334,7 +330,7 @@ mod tests {
             &events,
             now,
             Duration::minutes(15),
-            None,
+            &BTreeMap::new(),
         );
         // Price also hit the stop loss; that should win over the news
         // exit that would otherwise also apply, since it's checked first.

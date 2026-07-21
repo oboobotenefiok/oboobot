@@ -28,10 +28,10 @@ use daemon::{
     allows_new_entries, already_entered_this_cycle, apply_reconciliation, auto_action,
     available_disk_mb, check_broker_heartbeat, evaluate_exits, kill_switch_engaged,
     notifier_from_config, reconcile, resident_memory_mb, AssistantEngine, Config, DecisionRecord,
-    HealthCheckFailure, HealthMonitor, LoggingAssistant, NewsProvider, NoNewsProvider,
+    HealthCheckFailure, HealthMonitor, LoggingAssistant, NewsProvider, NoNewsProvider, PairConfig,
     StatusSnapshot,
 };
-use domain::{Bias, Direction, Event, EventEnvelope, OrderRequest, OrderType, Position, Usd};
+use domain::{Bias, Direction, Event, EventEnvelope, OrderRequest, OrderType, Position, Tier, Usd};
 use persistence::{CursorFile, SnapshotFile};
 use risk::RiskEngine as _;
 use rust_decimal::Decimal;
@@ -125,6 +125,21 @@ async fn write_status(
     }
 }
 
+/// One configured pair-set's market state for a single cycle: its own
+/// prices, buffers-derived divergence inputs, resolved divergence (if
+/// any), and spread history. Collected once per pair-set before the
+/// exit sweep (which needs all of them at once) and then walked again
+/// for entries (which only needs one at a time).
+struct PairCycleState {
+    pair_config: PairConfig,
+    primary_price: Decimal,
+    secondary_price: Decimal,
+    divergence_inputs: DivergenceInputs,
+    resolved_divergence: Option<(String, Direction, Tier)>,
+    spread_history: strategy::SpreadHistory,
+    current_spread: Decimal,
+}
+
 /// The real, deployable path.
 async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&cli.state_dir).await?;
@@ -141,11 +156,9 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     }
 
     let config = Config::load(&cli.config).await?;
-    let Some(pair_config) = config.pairs.first().cloned() else {
+    if config.pairs.is_empty() {
         anyhow::bail!("no pairs configured");
-    };
-    let primary = pair_config.primary;
-    let secondary = pair_config.secondary;
+    }
 
     let health = HealthMonitor::new();
     let notifier = notifier_from_config(&config.notifications);
@@ -156,20 +169,6 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         CursorFile::new(cli.state_dir.join("positions.cursor"));
     let decisions_cursor: CursorFile<DecisionRecord> =
         CursorFile::new(cli.state_dir.join("decisions.cursor"));
-    let daily_primary_snap: SnapshotFile<strategy::RollingBuffer> =
-        SnapshotFile::new(cli.state_dir.join(format!("buffer_daily_{primary}.json")));
-    let daily_secondary_snap: SnapshotFile<strategy::RollingBuffer> =
-        SnapshotFile::new(cli.state_dir.join(format!("buffer_daily_{secondary}.json")));
-    let session_primary_snap: SnapshotFile<strategy::RollingBuffer> =
-        SnapshotFile::new(cli.state_dir.join(format!("buffer_session_{primary}.json")));
-    let session_secondary_snap: SnapshotFile<strategy::RollingBuffer> = SnapshotFile::new(
-        cli.state_dir
-            .join(format!("buffer_session_{secondary}.json")),
-    );
-    let correlation_snap: SnapshotFile<strategy::CorrelationState> =
-        SnapshotFile::new(cli.state_dir.join("correlation.json"));
-    let spread_snap: SnapshotFile<strategy::SpreadHistory> =
-        SnapshotFile::new(cli.state_dir.join("spread_history.json"));
     let weekly_true_open_snap: SnapshotFile<session_time::TrueOpenLevel> =
         SnapshotFile::new(cli.state_dir.join("true_open_weekly.json"));
     let daily_true_open_snap: SnapshotFile<session_time::TrueOpenLevel> =
@@ -209,13 +208,26 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     }
     let mut open_positions = apply_reconciliation(&report);
 
+    // One snapshot covers every pair-set configured this cycle: the
+    // union of each pair-set's primary and secondary, deduplicated, so a
+    // symbol shared across two pair-sets is only ever fetched once.
+    let mut all_symbols: Vec<String> = Vec::new();
+    for pair_config in &config.pairs {
+        if !all_symbols.contains(&pair_config.primary) {
+            all_symbols.push(pair_config.primary.clone());
+        }
+        if !all_symbols.contains(&pair_config.secondary) {
+            all_symbols.push(pair_config.secondary.clone());
+        }
+    }
+
     // The heartbeat-wrapped snapshot call: this is both the broker
     // health check and the actual market data for everything below it.
     let heartbeat_timeout = std::time::Duration::from_secs(15);
     let snapshot = match check_broker_heartbeat(
         &health,
         heartbeat_timeout,
-        broker.get_snapshot(&[primary.clone(), secondary.clone()]),
+        broker.get_snapshot(&all_symbols),
     )
     .await
     {
@@ -238,20 +250,13 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     };
 
     let now = chrono::Utc::now();
-    let primary_price = snapshot
-        .prices
-        .get(&primary)
-        .map(|q| q.bid)
-        .unwrap_or(Decimal::ZERO);
-    let secondary_price = snapshot
-        .prices
-        .get(&secondary)
-        .map(|q| q.bid)
-        .unwrap_or(Decimal::ZERO);
-    tracing::info!(
-        %primary, primary_price = %primary_price, %secondary, secondary_price = %secondary_price,
-        "broker heartbeat ok, snapshot fetched"
-    );
+    // Quarterly Theory's Tuesday risk-doubling is an NY-calendar-day
+    // concept, like every other session boundary this strategy cares
+    // about, so it's computed in NY local time rather than UTC: the two
+    // disagree for several hours around each NY midnight, which matters
+    // right at the day boundary this flag cares about.
+    let is_tuesday = chrono::Datelike::weekday(&session_time::to_ny(now)) == chrono::Weekday::Tue;
+    tracing::debug!(%is_tuesday, "day-of-week check (NY time)");
 
     if let Some(mb) = available_disk_mb(&cli.state_dir).await {
         tracing::debug!(available_disk_mb = mb, "disk check");
@@ -270,97 +275,152 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Update the rolling market-state files. Always, regardless of
-    // window: even a cycle that ends up not trading still contributes
-    // an observation to the buffers, correlation window, and spread
-    // history, which is exactly what lets those be real by the time a
-    // window does roll around.
-    let daily_primary =
-        strategy::update_daily_buffer(daily_primary_snap.read().await?, primary_price, now);
-    daily_primary_snap.write(&daily_primary).await?;
-    let daily_secondary =
-        strategy::update_daily_buffer(daily_secondary_snap.read().await?, secondary_price, now);
-    daily_secondary_snap.write(&daily_secondary).await?;
-    let session_primary =
-        strategy::update_session_buffer(session_primary_snap.read().await?, primary_price, now);
-    session_primary_snap.write(&session_primary).await?;
-    let session_secondary =
-        strategy::update_session_buffer(session_secondary_snap.read().await?, secondary_price, now);
-    session_secondary_snap.write(&session_secondary).await?;
+    // Per-pair-set market state. Each pair-set gets its own buffers,
+    // correlation window, and spread history, since a GBPUSD/EURUSD
+    // divergence reading has nothing to do with a USDJPY/AUDUSD one, and
+    // averaging them together would corrupt both.
+    let mut pair_states = Vec::with_capacity(config.pairs.len());
+    for pair_config in &config.pairs {
+        let primary = &pair_config.primary;
+        let secondary = &pair_config.secondary;
 
-    let mut correlation_state = correlation_snap.read().await?.unwrap_or_default();
-    correlation_state = strategy::record_sample(correlation_state, primary_price, secondary_price);
-    correlation_snap.write(&correlation_state).await?;
-    if let Some(shift) =
-        strategy::detect_regime_shift(&correlation_state, config.risk.regime_shift_threshold)
-    {
-        tracing::warn!(
-            baseline = shift.baseline,
-            current = shift.current,
-            "correlation regime shift detected"
+        let primary_price = snapshot
+            .prices
+            .get(primary)
+            .map(|q| q.bid)
+            .unwrap_or(Decimal::ZERO);
+        let secondary_price = snapshot
+            .prices
+            .get(secondary)
+            .map(|q| q.bid)
+            .unwrap_or(Decimal::ZERO);
+
+        let daily_primary_snap: SnapshotFile<strategy::RollingBuffer> =
+            SnapshotFile::new(cli.state_dir.join(format!("buffer_daily_{primary}.json")));
+        let daily_secondary_snap: SnapshotFile<strategy::RollingBuffer> =
+            SnapshotFile::new(cli.state_dir.join(format!("buffer_daily_{secondary}.json")));
+        let session_primary_snap: SnapshotFile<strategy::RollingBuffer> =
+            SnapshotFile::new(cli.state_dir.join(format!("buffer_session_{primary}.json")));
+        let session_secondary_snap: SnapshotFile<strategy::RollingBuffer> = SnapshotFile::new(
+            cli.state_dir
+                .join(format!("buffer_session_{secondary}.json")),
         );
-        notifier
-            .notify(&format!(
-                "oboobot: correlation regime shift (baseline {:.2} -> current {:.2})",
-                shift.baseline, shift.current
-            ))
-            .await;
+        let correlation_snap: SnapshotFile<strategy::CorrelationState> = SnapshotFile::new(
+            cli.state_dir
+                .join(format!("correlation_{primary}_{secondary}.json")),
+        );
+        let spread_snap: SnapshotFile<strategy::SpreadHistory> =
+            SnapshotFile::new(cli.state_dir.join(format!("spread_history_{primary}.json")));
+
+        let daily_primary =
+            strategy::update_daily_buffer(daily_primary_snap.read().await?, primary_price, now);
+        daily_primary_snap.write(&daily_primary).await?;
+        let daily_secondary =
+            strategy::update_daily_buffer(daily_secondary_snap.read().await?, secondary_price, now);
+        daily_secondary_snap.write(&daily_secondary).await?;
+        let session_primary =
+            strategy::update_session_buffer(session_primary_snap.read().await?, primary_price, now);
+        session_primary_snap.write(&session_primary).await?;
+        let session_secondary = strategy::update_session_buffer(
+            session_secondary_snap.read().await?,
+            secondary_price,
+            now,
+        );
+        session_secondary_snap.write(&session_secondary).await?;
+
+        let mut correlation_state = correlation_snap.read().await?.unwrap_or_default();
+        correlation_state =
+            strategy::record_sample(correlation_state, primary_price, secondary_price);
+        correlation_snap.write(&correlation_state).await?;
+        if let Some(shift) =
+            strategy::detect_regime_shift(&correlation_state, config.risk.regime_shift_threshold)
+        {
+            tracing::warn!(
+                %primary, %secondary, baseline = shift.baseline, current = shift.current,
+                "correlation regime shift detected"
+            );
+            notifier
+                .notify(&format!(
+                    "oboobot: correlation regime shift on {primary}/{secondary} (baseline {:.2} -> current {:.2})",
+                    shift.baseline, shift.current
+                ))
+                .await;
+        }
+
+        let mut spread_history = spread_snap.read().await?.unwrap_or_default();
+        let current_spread = snapshot
+            .spreads
+            .get(primary)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        spread_history.record(current_spread);
+        spread_snap.write(&spread_history).await?;
+
+        let divergence_inputs = DivergenceInputs {
+            primary_price,
+            secondary_price,
+            daily_primary_buffer: daily_primary.as_buffer_levels(),
+            daily_secondary_buffer: daily_secondary.as_buffer_levels(),
+            session_primary_buffer: session_primary.as_buffer_levels(),
+            session_secondary_buffer: session_secondary.as_buffer_levels(),
+        };
+        let resolved_divergence =
+            strategy::evaluate_smt(&divergence_inputs).map(|(target, direction, tier)| {
+                let pair = match target {
+                    TradeTarget::Primary => primary.clone(),
+                    TradeTarget::Secondary => secondary.clone(),
+                };
+                (pair, direction, tier)
+            });
+        tracing::debug!(
+            %primary, %secondary,
+            daily_primary_high = %daily_primary.high, daily_primary_low = %daily_primary.low,
+            session_primary_high = %session_primary.high, session_primary_low = %session_primary.low,
+            divergence = ?resolved_divergence,
+            "market state updated"
+        );
+
+        pair_states.push(PairCycleState {
+            pair_config: pair_config.clone(),
+            primary_price,
+            secondary_price,
+            divergence_inputs,
+            resolved_divergence,
+            spread_history,
+            current_spread,
+        });
     }
 
-    let mut spread_history = spread_snap.read().await?.unwrap_or_default();
-    let current_spread = snapshot
-        .spreads
-        .get(&primary)
-        .copied()
-        .unwrap_or(Decimal::ZERO);
-    spread_history.record(current_spread);
-    spread_snap.write(&spread_history).await?;
-
-    let divergence_inputs = DivergenceInputs {
-        primary_price,
-        secondary_price,
-        daily_primary_buffer: daily_primary.as_buffer_levels(),
-        daily_secondary_buffer: daily_secondary.as_buffer_levels(),
-        session_primary_buffer: session_primary.as_buffer_levels(),
-        session_secondary_buffer: session_secondary.as_buffer_levels(),
-    };
-    let current_divergence = strategy::evaluate_smt(&divergence_inputs);
-    tracing::debug!(
-        daily_primary_high = %daily_primary.high, daily_primary_low = %daily_primary.low,
-        session_primary_high = %session_primary.high, session_primary_low = %session_primary.low,
-        divergence = ?current_divergence,
-        "market state updated"
-    );
-
     // Exit-condition monitoring: always runs, independent of the entry
-    // window below. This is the fix for the bigger of the two gaps
-    // named in review: a position no longer sits unwatched between the
-    // cycle that opened it and whenever the next window happens to be.
+    // window below, and covers every open position regardless of which
+    // configured pair-set it came from. This is the fix for the bigger
+    // of the two gaps named in review: a position no longer sits
+    // unwatched between the cycle that opened it and whenever the next
+    // window happens to be.
     let news_events = news_provider
         .upcoming_events(now, chrono::Duration::minutes(15))
         .await;
-    // A position can now be open on either pair, so exits need a price
-    // per pair (not one flat price) and a divergence resolved down to
-    // the concrete pair name it's actually about, not the abstract
-    // primary/secondary role strategy::evaluate_smt reports it against.
-    let current_prices: BTreeMap<String, Decimal> = BTreeMap::from([
-        (primary.clone(), primary_price),
-        (secondary.clone(), secondary_price),
-    ]);
-    let current_divergence_for_exits = current_divergence.map(|(target, direction, tier)| {
-        let pair = match target {
-            TradeTarget::Primary => primary.clone(),
-            TradeTarget::Secondary => secondary.clone(),
-        };
-        (pair, direction, tier)
-    });
+    let current_prices: BTreeMap<String, Decimal> = snapshot
+        .prices
+        .iter()
+        .map(|(pair, quote)| (pair.clone(), quote.bid))
+        .collect();
+    let current_divergences: BTreeMap<String, (Direction, Tier)> = pair_states
+        .iter()
+        .filter_map(|state| {
+            state
+                .resolved_divergence
+                .as_ref()
+                .map(|(pair, direction, tier)| (pair.clone(), (*direction, *tier)))
+        })
+        .collect();
     let exits = evaluate_exits(
         &open_positions,
         &current_prices,
         &news_events,
         now,
         chrono::Duration::minutes(15),
-        current_divergence_for_exits,
+        &current_divergences,
     );
     for exit in &exits {
         match broker.close_position(exit.position_id).await {
@@ -374,12 +434,13 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                     .await;
                 // Look up which pair the closed position actually was:
                 // exits aren't only ever primary anymore, so the decision
-                // log should say which one this was, not default to primary.
+                // log should say which one this was, not default to
+                // whichever pair-set happens to be configured first.
                 let closed_pair = open_positions
                     .iter()
                     .find(|p| p.position_id == exit.position_id)
                     .map(|p| p.pair.clone())
-                    .unwrap_or_else(|| primary.clone());
+                    .unwrap_or_else(|| config.pairs[0].primary.clone());
                 decisions_cursor
                     .append(
                         &DecisionRecord::new(closed_pair, "position_closed")
@@ -405,12 +466,14 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Everything from here on is about *new* entries, which the window
-    // gates and exits never were.
+    // gates and exits never were. These three gates are global rather
+    // than per-pair-set: the window and holiday check are pure
+    // functions of `now`, and health state is account-wide, so none of
+    // them depend on which pair-set a signal might end up naming.
     if !cli.force && !session_time::is_within_macro_cycle(now) {
-        tracing::info!("not within a macro cycle window; exits were already checked above, no new entry considered");
-        decisions_cursor
-            .append(&DecisionRecord::new(primary.clone(), "outside_window"))
-            .await?;
+        tracing::info!(
+            "not within a macro cycle window; exits were already checked above, no new entry considered"
+        );
         write_status(
             &status_snap,
             &open_positions,
@@ -423,17 +486,11 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     }
     tracing::info!(
         forced = cli.force,
-        "within a macro cycle window, considering a new entry"
+        "within a macro cycle window, considering new entries"
     );
 
     if !allows_new_entries(health.current_state()) {
         tracing::info!(state = ?health.current_state(), action = auto_action(health.current_state()), "health state does not allow new entries");
-        decisions_cursor
-            .append(
-                &DecisionRecord::new(primary.clone(), "health_blocked")
-                    .with_detail(format!("{:?}", health.current_state())),
-            )
-            .await?;
         write_status(
             &status_snap,
             &open_positions,
@@ -447,9 +504,6 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
 
     if holidays.is_low_liquidity(now.date_naive()) {
         tracing::info!("today is a recognized low-liquidity period, skipping new entries");
-        decisions_cursor
-            .append(&DecisionRecord::new(primary.clone(), "holiday_skip"))
-            .await?;
         write_status(
             &status_snap,
             &open_positions,
@@ -461,217 +515,223 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let spread_multiplier = Decimal::try_from(config.risk.spread_multiplier).unwrap_or(dec!(1.5));
-    if !spread_history.passes_filter(current_spread, spread_multiplier) {
-        tracing::info!(current_spread = %current_spread, "spread filter rejected this cycle");
-        decisions_cursor
-            .append(&DecisionRecord::new(primary.clone(), "spread_rejected"))
-            .await?;
-        write_status(
-            &status_snap,
-            &open_positions,
-            &health,
-            Some("spread_rejected"),
-            false,
+    // One pass per configured pair-set: each gets its own spread filter,
+    // True Open bias, signal, collision check, and risk decision. A
+    // decision label is collected per pair-set so status.json's single
+    // summary field still says something useful about every pair-set
+    // this cycle touched, not just the last one evaluated.
+    let mut decision_summaries = Vec::with_capacity(pair_states.len());
+    for state in &pair_states {
+        let primary = &state.pair_config.primary;
+        let secondary = &state.pair_config.secondary;
+        let label = format!("{primary}/{secondary}");
+
+        let spread_multiplier =
+            Decimal::try_from(config.risk.spread_multiplier).unwrap_or(dec!(1.5));
+        if !state
+            .spread_history
+            .passes_filter(state.current_spread, spread_multiplier)
+        {
+            tracing::info!(%primary, current_spread = %state.current_spread, "spread filter rejected this cycle");
+            decisions_cursor
+                .append(&DecisionRecord::new(primary.clone(), "spread_rejected"))
+                .await?;
+            decision_summaries.push(format!("{label}: spread_rejected"));
+            continue;
+        }
+
+        let weekly_bias = load_or_capture_bias(
+            &weekly_true_open_snap,
+            session_time::Timeframe::Weekly,
+            primary,
+            state.primary_price,
+            now,
+            &holidays,
         )
-        .await;
-        return Ok(());
-    }
+        .await?;
+        let daily_bias = load_or_capture_bias(
+            &daily_true_open_snap,
+            session_time::Timeframe::Daily,
+            primary,
+            state.primary_price,
+            now,
+            &holidays,
+        )
+        .await?;
 
-    let weekly_bias = load_or_capture_bias(
-        &weekly_true_open_snap,
-        session_time::Timeframe::Weekly,
-        &primary,
-        primary_price,
-        now,
-        &holidays,
-    )
-    .await?;
-    let daily_bias = load_or_capture_bias(
-        &daily_true_open_snap,
-        session_time::Timeframe::Daily,
-        &primary,
-        primary_price,
-        now,
-        &holidays,
-    )
-    .await?;
+        let outcome = generate_signal(
+            &state.divergence_inputs,
+            weekly_bias,
+            daily_bias,
+            primary.clone(),
+            secondary.clone(),
+            snapshot.snapshot_id,
+            dec!(0.8),
+            dec!(0.8),
+            now + chrono::Duration::minutes(20),
+        );
 
-    let outcome = generate_signal(
-        &divergence_inputs,
-        weekly_bias,
-        daily_bias,
-        primary.clone(),
-        secondary.clone(),
-        snapshot.snapshot_id,
-        dec!(0.8),
-        dec!(0.8),
-        now + chrono::Duration::minutes(20),
-    );
-
-    // The collision check needs to know which pair the signal actually
-    // names, which isn't known until generate_signal returns: a
-    // divergence can point at either primary or secondary, so this can
-    // no longer be checked against a hardcoded pair up front.
-    if let SignalOutcome::Signal(ref signal) = outcome {
-        if already_entered_this_cycle(&signal.pair, &open_positions, now) {
-            tracing::info!(pair = %signal.pair, "already entered this pair within the current cycle window, skipping");
-            decisions_cursor
-                .append(&DecisionRecord::new(signal.pair.clone(), "collision_skip"))
-                .await?;
-            write_status(
-                &status_snap,
-                &open_positions,
-                &health,
-                Some("collision_skip"),
-                false,
-            )
-            .await;
-            return Ok(());
-        }
-    }
-
-    let last_decision = match outcome {
-        SignalOutcome::NoDivergence => {
-            tracing::info!("no SMT divergence this cycle, nothing to evaluate");
-            decisions_cursor
-                .append(&DecisionRecord::new(primary.clone(), "no_divergence"))
-                .await?;
-            "no_divergence".to_string()
-        }
-        SignalOutcome::Rejected(invalidated) => {
-            tracing::info!(
-                reason = ?invalidated.rejection_reason,
-                weekly_bias = ?invalidated.weekly_bias,
-                daily_bias = ?invalidated.daily_bias,
-                smt_direction = ?invalidated.smt_direction,
-                "signal generated but rejected by the True Open gate"
-            );
-            decisions_cursor
-                .append(
-                    &DecisionRecord::new(primary.clone(), "gate_rejected")
-                        .with_detail(format!("{:?}", invalidated.rejection_reason)),
-                )
-                .await?;
-            "gate_rejected".to_string()
-        }
-        SignalOutcome::Signal(signal) => {
-            tracing::info!(tier = ?signal.tier, direction = ?signal.direction, "signal passed the True Open gate");
-            let risk_config = risk::RiskConfig {
-                base_risk_percent: domain::Percent::from_percentage(
-                    Decimal::try_from(config.risk.base_risk_percent).unwrap_or(dec!(1.0)),
-                ),
-                max_risk_percent: domain::Percent::from_percentage(
-                    Decimal::try_from(config.risk.max_risk_percent).unwrap_or(dec!(5.0)),
-                ),
-                max_open_positions: config.risk.max_open_positions,
-                daily_loss_limit_percent: domain::Percent::from_percentage(
-                    Decimal::try_from(config.risk.daily_loss_limit_percent).unwrap_or(dec!(5.0)),
-                ),
-                weekly_loss_limit_percent: domain::Percent::from_percentage(
-                    Decimal::try_from(config.risk.weekly_loss_limit_percent).unwrap_or(dec!(10.0)),
-                ),
-            };
-
-            let equity = broker.get_account_equity().await?;
-            // Fall back to whichever of primary_price/secondary_price
-            // actually matches signal.pair, not always primary_price: a
-            // missing snapshot entry for secondary shouldn't silently
-            // price a secondary-pair entry off primary's number.
-            let fallback_price = if signal.pair == secondary {
-                secondary_price
-            } else {
-                primary_price
-            };
-            let entry_price = match signal.direction {
-                Direction::Buy => snapshot
-                    .prices
-                    .get(&signal.pair)
-                    .map(|q| q.ask)
-                    .unwrap_or(fallback_price),
-                Direction::Sell => snapshot
-                    .prices
-                    .get(&signal.pair)
-                    .map(|q| q.bid)
-                    .unwrap_or(fallback_price),
-            };
-            let stop_loss_price = match signal.direction {
-                Direction::Buy => entry_price - dec!(0.0050),
-                Direction::Sell => entry_price + dec!(0.0050),
-            };
-            let take_profit_price = match signal.direction {
-                Direction::Buy => entry_price + dec!(0.0150),
-                Direction::Sell => entry_price - dec!(0.0150),
-            };
-
-            let risk_context = risk::RiskContext {
-                equity,
-                open_position_count: open_positions.len(),
-                is_tuesday: false,
-                is_double_smt: signal.tier == domain::Tier::Double,
-                entry_price,
-                stop_loss_price,
-                take_profit_price,
-                realized_pnl_today: Usd::zero(),
-                realized_pnl_this_week: Usd::zero(),
-            };
-
-            let risk_engine = risk::DefaultRiskEngine;
-            let decision = risk_engine.evaluate(&signal, &risk_config, &risk_context)?;
-
-            if !decision.approved {
-                tracing::info!(reason = ?decision.rejection_reason, "risk engine rejected the signal");
+        // The collision check needs to know which pair the signal
+        // actually names, which isn't known until generate_signal
+        // returns: a divergence can point at either primary or
+        // secondary, so this can't be checked against a hardcoded pair
+        // up front.
+        if let SignalOutcome::Signal(ref signal) = outcome {
+            if already_entered_this_cycle(&signal.pair, &open_positions, now) {
+                tracing::info!(pair = %signal.pair, "already entered this pair within the current cycle window, skipping");
                 decisions_cursor
-                    .append(
-                        &DecisionRecord::new(signal.pair.clone(), "risk_rejected")
-                            .with_detail(decision.rejection_reason.clone().unwrap_or_default()),
-                    )
+                    .append(&DecisionRecord::new(signal.pair.clone(), "collision_skip"))
                     .await?;
-                "risk_rejected".to_string()
-            } else {
-                tracing::info!(
-                    size = %decision.position_size, risk_percent = %decision.risk_percent, risk_currency = %decision.risk_currency,
-                    "risk engine approved sizing"
-                );
-                let request = OrderRequest {
-                    order_id: Uuid::new_v4(),
-                    trace_id: signal.trace_id,
-                    signal_id: signal.signal_id,
-                    pair: signal.pair.clone(),
-                    side: signal.direction,
-                    size: decision.position_size,
-                    order_type: OrderType::Market,
-                    price: None,
-                    stop_loss: Some(decision.stop_loss),
-                    take_profit: Some(decision.take_profit),
-                    confirming_snapshot_id: snapshot.snapshot_id,
-                };
-                let order = broker.submit_order(request).await?;
-                tracing::info!(order_id = %order.order_id, status = ?order.status, "order submitted");
-                notifier
-                    .notify(&format!(
-                        "oboobot: opened {:?} {} (size {})",
-                        signal.direction, signal.pair, decision.position_size
-                    ))
-                    .await;
-
-                open_positions = broker.list_open_positions().await?;
-                for position in &open_positions {
-                    positions_cursor.append(position).await?;
-                }
-                decisions_cursor
-                    .append(&DecisionRecord::new(signal.pair.clone(), "order_submitted"))
-                    .await?;
-                "order_submitted".to_string()
+                decision_summaries.push(format!("{label}: collision_skip"));
+                continue;
             }
         }
-    };
+
+        let decision_label = match outcome {
+            SignalOutcome::NoDivergence => {
+                tracing::info!(%primary, %secondary, "no SMT divergence this cycle, nothing to evaluate");
+                decisions_cursor
+                    .append(&DecisionRecord::new(primary.clone(), "no_divergence"))
+                    .await?;
+                "no_divergence".to_string()
+            }
+            SignalOutcome::Rejected(invalidated) => {
+                tracing::info!(
+                    reason = ?invalidated.rejection_reason,
+                    weekly_bias = ?invalidated.weekly_bias,
+                    daily_bias = ?invalidated.daily_bias,
+                    smt_direction = ?invalidated.smt_direction,
+                    "signal generated but rejected by the True Open gate"
+                );
+                decisions_cursor
+                    .append(
+                        &DecisionRecord::new(primary.clone(), "gate_rejected")
+                            .with_detail(format!("{:?}", invalidated.rejection_reason)),
+                    )
+                    .await?;
+                "gate_rejected".to_string()
+            }
+            SignalOutcome::Signal(signal) => {
+                tracing::info!(tier = ?signal.tier, direction = ?signal.direction, pair = %signal.pair, "signal passed the True Open gate");
+                let risk_config = risk::RiskConfig {
+                    base_risk_percent: domain::Percent::from_percentage(
+                        Decimal::try_from(config.risk.base_risk_percent).unwrap_or(dec!(1.0)),
+                    ),
+                    max_risk_percent: domain::Percent::from_percentage(
+                        Decimal::try_from(config.risk.max_risk_percent).unwrap_or(dec!(5.0)),
+                    ),
+                    max_open_positions: config.risk.max_open_positions,
+                    daily_loss_limit_percent: domain::Percent::from_percentage(
+                        Decimal::try_from(config.risk.daily_loss_limit_percent)
+                            .unwrap_or(dec!(5.0)),
+                    ),
+                    weekly_loss_limit_percent: domain::Percent::from_percentage(
+                        Decimal::try_from(config.risk.weekly_loss_limit_percent)
+                            .unwrap_or(dec!(10.0)),
+                    ),
+                };
+
+                let equity = broker.get_account_equity().await?;
+                // Fall back to whichever of primary_price/secondary_price
+                // actually matches signal.pair, not always primary_price: a
+                // missing snapshot entry for secondary shouldn't silently
+                // price a secondary-pair entry off primary's number.
+                let fallback_price = if signal.pair == *secondary {
+                    state.secondary_price
+                } else {
+                    state.primary_price
+                };
+                let entry_price = match signal.direction {
+                    Direction::Buy => snapshot
+                        .prices
+                        .get(&signal.pair)
+                        .map(|q| q.ask)
+                        .unwrap_or(fallback_price),
+                    Direction::Sell => snapshot
+                        .prices
+                        .get(&signal.pair)
+                        .map(|q| q.bid)
+                        .unwrap_or(fallback_price),
+                };
+                let stop_loss_price = match signal.direction {
+                    Direction::Buy => entry_price - dec!(0.0050),
+                    Direction::Sell => entry_price + dec!(0.0050),
+                };
+                let take_profit_price = match signal.direction {
+                    Direction::Buy => entry_price + dec!(0.0150),
+                    Direction::Sell => entry_price - dec!(0.0150),
+                };
+
+                let risk_context = risk::RiskContext {
+                    equity,
+                    open_position_count: open_positions.len(),
+                    is_tuesday,
+                    is_double_smt: signal.tier == domain::Tier::Double,
+                    entry_price,
+                    stop_loss_price,
+                    take_profit_price,
+                    realized_pnl_today: Usd::zero(),
+                    realized_pnl_this_week: Usd::zero(),
+                };
+
+                let risk_engine = risk::DefaultRiskEngine;
+                let decision = risk_engine.evaluate(&signal, &risk_config, &risk_context)?;
+
+                if !decision.approved {
+                    tracing::info!(reason = ?decision.rejection_reason, "risk engine rejected the signal");
+                    decisions_cursor
+                        .append(
+                            &DecisionRecord::new(signal.pair.clone(), "risk_rejected")
+                                .with_detail(decision.rejection_reason.clone().unwrap_or_default()),
+                        )
+                        .await?;
+                    "risk_rejected".to_string()
+                } else {
+                    tracing::info!(
+                        size = %decision.position_size, risk_percent = %decision.risk_percent, risk_currency = %decision.risk_currency,
+                        "risk engine approved sizing"
+                    );
+                    let request = OrderRequest {
+                        order_id: Uuid::new_v4(),
+                        trace_id: signal.trace_id,
+                        signal_id: signal.signal_id,
+                        pair: signal.pair.clone(),
+                        side: signal.direction,
+                        size: decision.position_size,
+                        order_type: OrderType::Market,
+                        price: None,
+                        stop_loss: Some(decision.stop_loss),
+                        take_profit: Some(decision.take_profit),
+                        confirming_snapshot_id: snapshot.snapshot_id,
+                    };
+                    let order = broker.submit_order(request).await?;
+                    tracing::info!(order_id = %order.order_id, status = ?order.status, "order submitted");
+                    notifier
+                        .notify(&format!(
+                            "oboobot: opened {:?} {} (size {})",
+                            signal.direction, signal.pair, decision.position_size
+                        ))
+                        .await;
+
+                    open_positions = broker.list_open_positions().await?;
+                    for position in &open_positions {
+                        positions_cursor.append(position).await?;
+                    }
+                    decisions_cursor
+                        .append(&DecisionRecord::new(signal.pair.clone(), "order_submitted"))
+                        .await?;
+                    "order_submitted".to_string()
+                }
+            }
+        };
+        decision_summaries.push(format!("{label}: {decision_label}"));
+    }
 
     write_status(
         &status_snap,
         &open_positions,
         &health,
-        Some(&last_decision),
+        Some(&decision_summaries.join("; ")),
         false,
     )
     .await;
@@ -967,7 +1027,8 @@ async fn run_cycle(
             let context = risk::RiskContext {
                 equity,
                 open_position_count: open_positions.len(),
-                is_tuesday: false,
+                is_tuesday: chrono::Datelike::weekday(&session_time::to_ny(snapshot.timestamp))
+                    == chrono::Weekday::Tue,
                 is_double_smt: signal.tier == domain::Tier::Double,
                 entry_price,
                 stop_loss_price,
