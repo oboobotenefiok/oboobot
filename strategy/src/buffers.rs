@@ -113,14 +113,20 @@ const MAX_SPREAD_SAMPLES: usize = 900;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpreadHistory {
     pub samples: Vec<Decimal>,
+    /// When `record` last actually added a sample. Same reasoning as
+    /// `CorrelationState::last_updated`: this struct only tracks its own
+    /// history, not what counts as "too old" for the daemon overall.
+    #[serde(default)]
+    pub last_updated: Option<DateTime<Utc>>,
 }
 
 impl SpreadHistory {
-    pub fn record(&mut self, spread: Decimal) {
+    pub fn record(&mut self, spread: Decimal, now: DateTime<Utc>) {
         self.samples.push(spread);
         if self.samples.len() > MAX_SPREAD_SAMPLES {
             self.samples.remove(0);
         }
+        self.last_updated = Some(now);
     }
 
     pub fn average(&self) -> Option<Decimal> {
@@ -210,9 +216,10 @@ mod tests {
 
     #[test]
     fn spread_filter_rejects_a_spread_beyond_the_multiplied_average() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         let mut history = SpreadHistory::default();
         for _ in 0..10 {
-            history.record(dec!(0.0002));
+            history.record(dec!(0.0002), now);
         }
         // average 0.0002, multiplier 1.5 -> threshold 0.0003
         assert!(!history.passes_filter(dec!(0.0005), dec!(1.5)));
@@ -221,10 +228,20 @@ mod tests {
 
     #[test]
     fn spread_history_caps_at_the_maximum_sample_count() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         let mut history = SpreadHistory::default();
         for i in 0..(MAX_SPREAD_SAMPLES + 20) {
-            history.record(Decimal::from(i as i64));
+            history.record(Decimal::from(i as i64), now);
         }
         assert_eq!(history.samples.len(), MAX_SPREAD_SAMPLES);
+    }
+
+    #[test]
+    fn recording_a_spread_stamps_last_updated() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
+        let mut history = SpreadHistory::default();
+        assert_eq!(history.last_updated, None);
+        history.record(dec!(0.0002), now);
+        assert_eq!(history.last_updated, Some(now));
     }
 }

@@ -99,6 +99,7 @@ pub enum HealthCheckFailure {
     MemoryUsageCritical,
     NewsApiDown,
     CorrelationStale,
+    SpreadHistoryStale,
     SnapshotLatencyExceeded,
     QueueBackpressure,
 }
@@ -117,6 +118,7 @@ pub fn severity_for(failure: HealthCheckFailure) -> SystemState {
         HealthCheckFailure::DiskUsageCritical => SystemState::EmergencyShutdown,
         HealthCheckFailure::MemoryUsageCritical => SystemState::EmergencyShutdown,
         HealthCheckFailure::CorrelationStale => SystemState::Degraded,
+        HealthCheckFailure::SpreadHistoryStale => SystemState::Degraded,
         HealthCheckFailure::SnapshotLatencyExceeded => SystemState::Degraded,
         HealthCheckFailure::QueueBackpressure => SystemState::Degraded,
     }
@@ -212,12 +214,11 @@ mod tests {
         let monitor = HealthMonitor::new();
         monitor.report_failure(HealthCheckFailure::BrokerHeartbeatFailure);
 
-        let result: Result<u32, HeartbeatError<String>> = check_broker_heartbeat(
-            &monitor,
-            std::time::Duration::from_secs(1),
-            async { Ok::<u32, String>(42) },
-        )
-        .await;
+        let result: Result<u32, HeartbeatError<String>> =
+            check_broker_heartbeat(&monitor, std::time::Duration::from_secs(1), async {
+                Ok::<u32, String>(42)
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(monitor.current_state(), SystemState::Healthy);
@@ -226,12 +227,11 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_check_reports_failure_when_the_call_errors() {
         let monitor = HealthMonitor::new();
-        let result: Result<u32, HeartbeatError<String>> = check_broker_heartbeat(
-            &monitor,
-            std::time::Duration::from_secs(1),
-            async { Err::<u32, String>("boom".to_string()) },
-        )
-        .await;
+        let result: Result<u32, HeartbeatError<String>> =
+            check_broker_heartbeat(&monitor, std::time::Duration::from_secs(1), async {
+                Err::<u32, String>("boom".to_string())
+            })
+            .await;
 
         assert!(matches!(result, Err(HeartbeatError::CallFailed(_))));
         assert_eq!(monitor.current_state(), SystemState::ReadOnly);
@@ -240,15 +240,12 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_check_reports_failure_on_timeout_without_panicking() {
         let monitor = HealthMonitor::new();
-        let result: Result<u32, HeartbeatError<String>> = check_broker_heartbeat(
-            &monitor,
-            std::time::Duration::from_millis(10),
-            async {
+        let result: Result<u32, HeartbeatError<String>> =
+            check_broker_heartbeat(&monitor, std::time::Duration::from_millis(10), async {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Ok::<u32, String>(42)
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert!(matches!(result, Err(HeartbeatError::TimedOut(_))));
         assert_eq!(monitor.current_state(), SystemState::ReadOnly);
@@ -296,6 +293,13 @@ mod tests {
         monitor.report_failure(HealthCheckFailure::QueueBackpressure);
         monitor.clear_failure(HealthCheckFailure::QueueBackpressure);
         assert_eq!(monitor.current_state(), SystemState::Healthy);
+    }
+
+    #[test]
+    fn spread_history_stale_escalates_to_degraded() {
+        let monitor = HealthMonitor::new();
+        monitor.report_failure(HealthCheckFailure::SpreadHistoryStale);
+        assert_eq!(monitor.current_state(), SystemState::Degraded);
     }
 
     #[test]

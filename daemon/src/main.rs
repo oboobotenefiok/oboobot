@@ -138,6 +138,16 @@ struct PairCycleState {
     resolved_divergence: Option<(String, Direction, Tier)>,
     spread_history: strategy::SpreadHistory,
     current_spread: Decimal,
+    /// The live Pearson coefficient between this pair-set's primary and
+    /// secondary, `None` if there aren't enough samples yet. Reused for
+    /// the correlated-exposure risk check below: it only ever covers
+    /// this pair-set's own primary/secondary relationship, not a full
+    /// matrix against every other configured pair-set's pairs too, so a
+    /// position on some other pair-set never counts as correlated
+    /// exposure here even if it happens to be, in reality. Covering
+    /// that would need a correlation window per pair of symbols, not
+    /// per pair-set, which is real work of its own.
+    correlation_coefficient: Option<f64>,
 }
 
 /// The real, deployable path.
@@ -275,11 +285,38 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // How far behind wall-clock time the broker's own reported snapshot
+    // timestamp is. A broker feed can respond successfully (so the
+    // heartbeat check above stays green) while still handing back
+    // increasingly stale prices, which this catches and the heartbeat
+    // check can't.
+    let snapshot_latency = now.signed_duration_since(snapshot.timestamp);
+    tracing::debug!(
+        snapshot_latency_seconds = snapshot_latency.num_seconds(),
+        "snapshot latency check"
+    );
+    if snapshot_latency.num_seconds() > config.risk.snapshot_latency_threshold_seconds {
+        health.report_failure(HealthCheckFailure::SnapshotLatencyExceeded);
+    } else {
+        health.clear_failure(HealthCheckFailure::SnapshotLatencyExceeded);
+    }
+
+    if news_provider.is_fresh(now).await {
+        health.clear_failure(HealthCheckFailure::NewsApiDown);
+    } else {
+        health.report_failure(HealthCheckFailure::NewsApiDown);
+    }
+
     // Per-pair-set market state. Each pair-set gets its own buffers,
     // correlation window, and spread history, since a GBPUSD/EURUSD
     // divergence reading has nothing to do with a USDJPY/AUDUSD one, and
     // averaging them together would corrupt both.
     let mut pair_states = Vec::with_capacity(config.pairs.len());
+    let mut any_correlation_stale = false;
+    let mut any_spread_stale = false;
+    let correlation_staleness_limit =
+        chrono::Duration::minutes(config.risk.correlation_staleness_minutes);
+    let spread_staleness_limit = chrono::Duration::minutes(config.risk.spread_staleness_minutes);
     for pair_config in &config.pairs {
         let primary = &pair_config.primary;
         let secondary = &pair_config.secondary;
@@ -329,8 +366,14 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         session_secondary_snap.write(&session_secondary).await?;
 
         let mut correlation_state = correlation_snap.read().await?.unwrap_or_default();
+        // Captured before record_sample below stamps this cycle's own
+        // now onto it: staleness has to mean "the last invocation that
+        // actually got this far was too long ago," not "the update this
+        // line is about to perform is itself late," which would never
+        // be true.
+        let correlation_last_updated_before_this_cycle = correlation_state.last_updated;
         correlation_state =
-            strategy::record_sample(correlation_state, primary_price, secondary_price);
+            strategy::record_sample(correlation_state, primary_price, secondary_price, now);
         correlation_snap.write(&correlation_state).await?;
         if let Some(shift) =
             strategy::detect_regime_shift(&correlation_state, config.risk.regime_shift_threshold)
@@ -348,12 +391,17 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         }
 
         let mut spread_history = spread_snap.read().await?.unwrap_or_default();
+        // Same reasoning as correlation_last_updated_before_this_cycle
+        // above: captured before this cycle's own record() call, so the
+        // staleness check below reflects the previous invocation, not
+        // this one.
+        let spread_last_updated_before_this_cycle = spread_history.last_updated;
         let current_spread = snapshot
             .spreads
             .get(primary)
             .copied()
             .unwrap_or(Decimal::ZERO);
-        spread_history.record(current_spread);
+        spread_history.record(current_spread, now);
         spread_snap.write(&spread_history).await?;
 
         let divergence_inputs = DivergenceInputs {
@@ -380,6 +428,20 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
             "market state updated"
         );
 
+        // A brand new state (last_updated still None) isn't "stale" in
+        // the sense this check cares about, it just hasn't had a first
+        // sample yet; that's an expected, temporary condition for a
+        // newly-added pair-set, not a data source that's stopped
+        // updating. Only an actual age past the threshold counts.
+        if correlation_last_updated_before_this_cycle
+            .is_some_and(|t| now - t > correlation_staleness_limit)
+        {
+            any_correlation_stale = true;
+        }
+        if spread_last_updated_before_this_cycle.is_some_and(|t| now - t > spread_staleness_limit) {
+            any_spread_stale = true;
+        }
+
         pair_states.push(PairCycleState {
             pair_config: pair_config.clone(),
             primary_price,
@@ -388,7 +450,19 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
             resolved_divergence,
             spread_history,
             current_spread,
+            correlation_coefficient: strategy::compute_coefficient(&correlation_state),
         });
+    }
+
+    if any_correlation_stale {
+        health.report_failure(HealthCheckFailure::CorrelationStale);
+    } else {
+        health.clear_failure(HealthCheckFailure::CorrelationStale);
+    }
+    if any_spread_stale {
+        health.report_failure(HealthCheckFailure::SpreadHistoryStale);
+    } else {
+        health.clear_failure(HealthCheckFailure::SpreadHistoryStale);
     }
 
     // Exit-condition monitoring: always runs, independent of the entry
@@ -515,6 +589,29 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Net exposure per currency across every currently open position,
+    // regardless of which pair-set it came from: this is what the
+    // currency-exposure risk check compares each candidate signal
+    // against. Built once here rather than per pair-set, since it's the
+    // same account-wide picture no matter which pair-set is being
+    // evaluated.
+    let mut currency_exposure: BTreeMap<String, Decimal> = BTreeMap::new();
+    for position in &open_positions {
+        if let Some((base, quote)) = risk::currency_pair(&position.pair) {
+            let size: Decimal = position.legs.iter().map(|leg| leg.size).sum();
+            let (base_direction, quote_direction) = match position.direction {
+                Direction::Buy => (Decimal::ONE, -Decimal::ONE),
+                Direction::Sell => (-Decimal::ONE, Decimal::ONE),
+            };
+            *currency_exposure
+                .entry(base.to_string())
+                .or_insert(Decimal::ZERO) += base_direction * size;
+            *currency_exposure
+                .entry(quote.to_string())
+                .or_insert(Decimal::ZERO) += quote_direction * size;
+        }
+    }
+
     // One pass per configured pair-set: each gets its own spread filter,
     // True Open bias, signal, collision check, and risk decision. A
     // decision label is collected per pair-set so status.json's single
@@ -629,6 +726,15 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                         Decimal::try_from(config.risk.weekly_loss_limit_percent)
                             .unwrap_or(dec!(10.0)),
                     ),
+                    max_exposure_per_currency_percent: domain::Percent::from_percentage(
+                        Decimal::try_from(config.risk.max_exposure_per_currency_percent)
+                            .unwrap_or(dec!(15.0)),
+                    ),
+                    max_correlation_exposure_percent: domain::Percent::from_percentage(
+                        Decimal::try_from(config.risk.max_correlation_exposure_percent)
+                            .unwrap_or(dec!(10.0)),
+                    ),
+                    correlation_exposure_threshold: config.risk.correlation_exposure_threshold,
                 };
 
                 let equity = broker.get_account_equity().await?;
@@ -662,6 +768,31 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                     Direction::Sell => entry_price - dec!(0.0150),
                 };
 
+                // Exposure already open on this pair-set's *other* pair,
+                // counted only if the live correlation between them is
+                // strong enough to matter. If signal.pair is primary,
+                // that's an open position on secondary, and vice versa;
+                // a pair-set only ever has the one counterpart to check.
+                let other_pair = if signal.pair == *primary {
+                    secondary
+                } else {
+                    primary
+                };
+                let correlated_exposure = match state.correlation_coefficient {
+                    Some(coefficient)
+                        if coefficient.abs() >= config.risk.correlation_exposure_threshold =>
+                    {
+                        open_positions
+                            .iter()
+                            .filter(|position| position.pair == *other_pair)
+                            .map(|position| {
+                                position.legs.iter().map(|leg| leg.size).sum::<Decimal>()
+                            })
+                            .sum()
+                    }
+                    _ => Decimal::ZERO,
+                };
+
                 let risk_context = risk::RiskContext {
                     equity,
                     open_position_count: open_positions.len(),
@@ -672,6 +803,8 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                     take_profit_price,
                     realized_pnl_today: Usd::zero(),
                     realized_pnl_this_week: Usd::zero(),
+                    currency_exposure: currency_exposure.clone(),
+                    correlated_exposure,
                 };
 
                 let risk_engine = risk::DefaultRiskEngine;
@@ -1000,6 +1133,9 @@ async fn run_cycle(
                 max_open_positions: 5,
                 daily_loss_limit_percent: domain::Percent::from_percentage(dec!(5.0)),
                 weekly_loss_limit_percent: domain::Percent::from_percentage(dec!(10.0)),
+                max_exposure_per_currency_percent: domain::Percent::from_percentage(dec!(15.0)),
+                max_correlation_exposure_percent: domain::Percent::from_percentage(dec!(10.0)),
+                correlation_exposure_threshold: 0.7,
             };
 
             let equity = broker.get_account_equity().await?;
@@ -1035,6 +1171,10 @@ async fn run_cycle(
                 take_profit_price,
                 realized_pnl_today: Usd::zero(),
                 realized_pnl_this_week: Usd::zero(),
+                // The demo harness only ever runs one scripted pair, so
+                // there's no meaningful cross-pair exposure to compute.
+                currency_exposure: std::collections::BTreeMap::new(),
+                correlated_exposure: Decimal::ZERO,
             };
 
             let risk_engine = risk::DefaultRiskEngine;

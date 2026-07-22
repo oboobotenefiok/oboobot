@@ -83,6 +83,9 @@ async fn a_full_cycle_goes_from_divergence_to_an_open_broker_position() {
         max_open_positions: 5,
         daily_loss_limit_percent: Percent::from_percentage(dec!(5.0)),
         weekly_loss_limit_percent: Percent::from_percentage(dec!(10.0)),
+        max_exposure_per_currency_percent: Percent::from_percentage(dec!(15.0)),
+        max_correlation_exposure_percent: Percent::from_percentage(dec!(10.0)),
+        correlation_exposure_threshold: 0.7,
     };
     let context = risk::RiskContext {
         equity: broker.get_account_equity().await.unwrap(),
@@ -94,6 +97,8 @@ async fn a_full_cycle_goes_from_divergence_to_an_open_broker_position() {
         take_profit_price: dec!(1.11500),
         realized_pnl_today: Usd::zero(),
         realized_pnl_this_week: Usd::zero(),
+        currency_exposure: std::collections::BTreeMap::new(),
+        correlated_exposure: dec!(0),
     };
 
     let risk_engine = risk::DefaultRiskEngine;

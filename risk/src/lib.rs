@@ -5,4 +5,6 @@
 
 pub mod sizing;
 
-pub use sizing::{DefaultRiskEngine, RiskConfig, RiskContext, RiskEngine, RiskError, RiskRejection};
+pub use sizing::{
+    currency_pair, DefaultRiskEngine, RiskConfig, RiskContext, RiskEngine, RiskError, RiskRejection,
+};

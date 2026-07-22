@@ -25,6 +25,18 @@ use domain::NewsEvent;
 pub trait NewsProvider: Send + Sync {
     /// Every currently-known event expected within `window` of `now`.
     async fn upcoming_events(&self, now: DateTime<Utc>, window: Duration) -> Vec<NewsEvent>;
+
+    /// Whether this provider's data is fresh enough to trust right now.
+    /// Defaults to always fresh, which is the correct answer for
+    /// `NoNewsProvider`: it never claims to have actually polled
+    /// anything, so there's nothing of its own that can go stale. A
+    /// real provider (see the module doc for why one isn't built here)
+    /// overrides this to report whether its last successful fetch was
+    /// recent enough, which is what actually lets `HealthCheckFailure::
+    /// NewsApiDown` mean something once one exists.
+    async fn is_fresh(&self, _now: DateTime<Utc>) -> bool {
+        true
+    }
 }
 
 pub struct NoNewsProvider;
@@ -72,6 +84,13 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         let events = provider.upcoming_events(now, Duration::hours(1)).await;
         assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_news_provider_always_reports_fresh() {
+        let provider = NoNewsProvider;
+        let now = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
+        assert!(provider.is_fresh(now).await);
     }
 
     #[test]

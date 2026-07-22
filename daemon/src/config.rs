@@ -41,6 +41,18 @@ pub struct RiskSection {
     pub spread_multiplier: f64,
     #[serde(default = "default_regime_shift_threshold")]
     pub regime_shift_threshold: f64,
+    #[serde(default = "default_max_exposure_per_currency_percent")]
+    pub max_exposure_per_currency_percent: f64,
+    #[serde(default = "default_max_correlation_exposure_percent")]
+    pub max_correlation_exposure_percent: f64,
+    #[serde(default = "default_correlation_exposure_threshold")]
+    pub correlation_exposure_threshold: f64,
+    #[serde(default = "default_correlation_staleness_minutes")]
+    pub correlation_staleness_minutes: i64,
+    #[serde(default = "default_spread_staleness_minutes")]
+    pub spread_staleness_minutes: i64,
+    #[serde(default = "default_snapshot_latency_threshold_seconds")]
+    pub snapshot_latency_threshold_seconds: i64,
 }
 
 fn default_spread_multiplier() -> f64 {
@@ -49,6 +61,34 @@ fn default_spread_multiplier() -> f64 {
 
 fn default_regime_shift_threshold() -> f64 {
     0.20
+}
+
+fn default_max_exposure_per_currency_percent() -> f64 {
+    15.0
+}
+
+fn default_max_correlation_exposure_percent() -> f64 {
+    10.0
+}
+
+fn default_correlation_exposure_threshold() -> f64 {
+    0.7
+}
+
+// All three freshness thresholds default to a healthy margin above the
+// 5-minute invocation cadence: a handful of consecutive missed or
+// unlucky cycles shouldn't flip the daemon into Degraded on their own,
+// only a genuinely stuck data source should.
+fn default_correlation_staleness_minutes() -> i64 {
+    30
+}
+
+fn default_spread_staleness_minutes() -> i64 {
+    30
+}
+
+fn default_snapshot_latency_threshold_seconds() -> i64 {
+    120
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -91,8 +131,17 @@ impl Config {
                 weekly_loss_limit_percent: 10.0,
                 spread_multiplier: default_spread_multiplier(),
                 regime_shift_threshold: default_regime_shift_threshold(),
+                max_exposure_per_currency_percent: default_max_exposure_per_currency_percent(),
+                max_correlation_exposure_percent: default_max_correlation_exposure_percent(),
+                correlation_exposure_threshold: default_correlation_exposure_threshold(),
+                correlation_staleness_minutes: default_correlation_staleness_minutes(),
+                spread_staleness_minutes: default_spread_staleness_minutes(),
+                snapshot_latency_threshold_seconds: default_snapshot_latency_threshold_seconds(),
             },
-            pairs: vec![PairConfig { primary: "EURUSD".to_string(), secondary: "GBPUSD".to_string() }],
+            pairs: vec![PairConfig {
+                primary: "EURUSD".to_string(),
+                secondary: "GBPUSD".to_string(),
+            }],
             notifications: NotificationSection::default(),
         }
     }
@@ -104,12 +153,17 @@ impl Config {
                 return Ok(Self::default_config());
             }
             Err(source) => {
-                return Err(ConfigError::Io { path: path.display().to_string(), source });
+                return Err(ConfigError::Io {
+                    path: path.display().to_string(),
+                    source,
+                });
             }
         };
 
-        let config: Config = toml::from_str(&contents)
-            .map_err(|source| ConfigError::Parse { path: path.display().to_string(), source })?;
+        let config: Config = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.display().to_string(),
+            source,
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -122,7 +176,9 @@ impl Config {
             )));
         }
         if self.risk.base_risk_percent <= 0.0 {
-            return Err(ConfigError::Invalid("risk.base_risk_percent must be positive".to_string()));
+            return Err(ConfigError::Invalid(
+                "risk.base_risk_percent must be positive".to_string(),
+            ));
         }
         if self.risk.spread_multiplier <= 1.0 {
             return Err(ConfigError::Invalid(format!(
@@ -137,10 +193,14 @@ impl Config {
             )));
         }
         if self.risk.max_open_positions == 0 {
-            return Err(ConfigError::Invalid("risk.max_open_positions must be at least 1".to_string()));
+            return Err(ConfigError::Invalid(
+                "risk.max_open_positions must be at least 1".to_string(),
+            ));
         }
         if self.pairs.is_empty() {
-            return Err(ConfigError::Invalid("at least one pair must be configured".to_string()));
+            return Err(ConfigError::Invalid(
+                "at least one pair must be configured".to_string(),
+            ));
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -165,7 +225,9 @@ mod tests {
     #[tokio::test]
     async fn missing_config_file_falls_back_to_the_default() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("does_not_exist.toml")).await.unwrap();
+        let config = Config::load(&dir.path().join("does_not_exist.toml"))
+            .await
+            .unwrap();
         assert_eq!(config.pairs.len(), 1);
     }
 

@@ -24,6 +24,15 @@ const MAX_SAMPLES: usize = 500;
 pub struct CorrelationState {
     pub samples: Vec<(Decimal, Decimal)>,
     pub baseline_coefficient: Option<f64>,
+    /// When `record_sample` last actually added a sample. `None` for a
+    /// state that's never been touched (freshly `Default`, or loaded
+    /// from a persisted file written before this field existed, via
+    /// `#[serde(default)]`). Staleness itself isn't decided here: this
+    /// struct only knows what it knows about itself, not what "too old"
+    /// means for the daemon as a whole, which is a health-monitoring
+    /// policy question the caller answers.
+    #[serde(default)]
+    pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,11 +48,13 @@ pub fn record_sample(
     mut state: CorrelationState,
     primary: Decimal,
     secondary: Decimal,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> CorrelationState {
     state.samples.push((primary, secondary));
     if state.samples.len() > MAX_SAMPLES {
         state.samples.remove(0);
     }
+    state.last_updated = Some(now);
     state
 }
 
@@ -128,12 +139,16 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    fn sample_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 3, 10, 12, 0, 0).unwrap()
+    }
+
     #[test]
     fn fewer_than_two_samples_gives_no_coefficient() {
         let state = CorrelationState::default();
         assert_eq!(compute_coefficient(&state), None);
 
-        let state = record_sample(state, dec!(1.1000), dec!(1.3000));
+        let state = record_sample(state, dec!(1.1000), dec!(1.3000), sample_time());
         assert_eq!(compute_coefficient(&state), None);
     }
 
@@ -142,7 +157,7 @@ mod tests {
         let mut state = CorrelationState::default();
         for i in 0..10 {
             let price = dec!(1.1000) + Decimal::new(i, 4);
-            state = record_sample(state, price, price); // identical series
+            state = record_sample(state, price, price, sample_time()); // identical series
         }
         let coefficient = compute_coefficient(&state).unwrap();
         assert!((coefficient - 1.0).abs() < 0.0001);
@@ -154,7 +169,7 @@ mod tests {
         for i in 0..10 {
             let up = dec!(1.1000) + Decimal::new(i, 4);
             let down = dec!(1.1000) - Decimal::new(i, 4);
-            state = record_sample(state, up, down);
+            state = record_sample(state, up, down, sample_time());
         }
         let coefficient = compute_coefficient(&state).unwrap();
         assert!((coefficient - (-1.0)).abs() < 0.0001);
@@ -164,7 +179,12 @@ mod tests {
     fn window_drops_the_oldest_sample_once_it_exceeds_the_cap() {
         let mut state = CorrelationState::default();
         for i in 0..(MAX_SAMPLES + 10) {
-            state = record_sample(state, Decimal::from(i as i64), Decimal::from(i as i64));
+            state = record_sample(
+                state,
+                Decimal::from(i as i64),
+                Decimal::from(i as i64),
+                sample_time(),
+            );
         }
         assert_eq!(state.samples.len(), MAX_SAMPLES);
     }
@@ -177,11 +197,19 @@ mod tests {
         };
         for i in 0..10 {
             let price = dec!(1.1000) + Decimal::new(i, 4);
-            state = record_sample(state, price, price); // current coefficient ~1.0
+            state = record_sample(state, price, price, sample_time()); // current coefficient ~1.0
         }
         // baseline 0.9, current ~1.0: deviation ~0.1, under a 0.2 threshold.
         assert!(detect_regime_shift(&state, 0.20).is_none());
         // but over a tighter 0.05 threshold, it should fire.
         assert!(detect_regime_shift(&state, 0.05).is_some());
+    }
+
+    #[test]
+    fn recording_a_sample_stamps_last_updated() {
+        let state = CorrelationState::default();
+        assert_eq!(state.last_updated, None);
+        let state = record_sample(state, dec!(1.1000), dec!(1.3000), sample_time());
+        assert_eq!(state.last_updated, Some(sample_time()));
     }
 }
