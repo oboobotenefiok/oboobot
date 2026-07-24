@@ -15,8 +15,7 @@ pub use events::{Bias, Event, EventEnvelope, RejectionReason, SignalInvalidated,
 pub use newtypes::{apply_multiplier, Coefficient, Percent, Usd};
 pub use types::{
     Asset, AssetClass, AssetPair, BrokerSnapshot, ComponentStatus, CorrelationQuality,
-    CorrelationRecord, CorrelationRegime, Direction, ExitReason, FillLeg, HealthStatus,
-    NewsEvent, NewsImpact, Order, OrderRequest, OrderStatus, OrderType, Position,
-    PositionStatus, PriceQuote, RecoveryState, RiskDecision, SpreadSample, SystemState, Tier,
-    TradeSignal,
+    CorrelationRecord, CorrelationRegime, Direction, ExitReason, FillLeg, HealthStatus, NewsEvent,
+    NewsImpact, Order, OrderRequest, OrderStatus, OrderType, Position, PositionStatus, PriceQuote,
+    RecoveryState, RiskDecision, SpreadSample, SystemState, Tier, TradeSignal,
 };

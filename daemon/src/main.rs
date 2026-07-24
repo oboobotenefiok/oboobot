@@ -31,7 +31,10 @@ use daemon::{
     HealthCheckFailure, HealthMonitor, LoggingAssistant, NewsProvider, NoNewsProvider, PairConfig,
     StatusSnapshot,
 };
-use domain::{Bias, Direction, Event, EventEnvelope, OrderRequest, OrderType, Position, Tier, Usd};
+use domain::{
+    Bias, Direction, Event, EventEnvelope, OrderRequest, OrderType, Position, Tier, TradeSignal,
+    Usd,
+};
 use persistence::{CursorFile, SnapshotFile};
 use risk::RiskEngine as _;
 use rust_decimal::Decimal;
@@ -196,27 +199,8 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     // Reconciliation always runs first: what does local state say is
     // open, and does the broker agree?
     let locally_known_positions = positions_cursor.read_all().await?;
-    let report = reconcile(broker.as_ref(), &locally_known_positions).await?;
-    if !report.is_clean() {
-        tracing::warn!(
-            orphaned = report.orphaned_locally.len(),
-            adopted = report.unknown_to_local.len(),
-            "reconciliation found a mismatch"
-        );
-        notifier
-            .notify(&format!(
-                "oboobot: reconciliation mismatch (orphaned={}, adopted={})",
-                report.orphaned_locally.len(),
-                report.unknown_to_local.len()
-            ))
-            .await;
-    } else {
-        tracing::info!(
-            known_positions = locally_known_positions.len(),
-            "reconciliation clean"
-        );
-    }
-    let mut open_positions = apply_reconciliation(&report);
+    let mut open_positions =
+        reconcile_and_notify(broker.as_ref(), &locally_known_positions, notifier.as_ref()).await?;
 
     // One snapshot covers every pair-set configured this cycle: the
     // union of each pair-set's primary and secondary, deduplicated, so a
@@ -366,6 +350,35 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         session_secondary_snap.write(&session_secondary).await?;
 
         let mut correlation_state = correlation_snap.read().await?.unwrap_or_default();
+        // A fresh window (no samples yet, whether this is the very
+        // first cycle for this pair-set or the state file was somehow
+        // cleared) gets a one-time historical warmup before today's
+        // live sample joins it, so correlation readings are meaningful
+        // from the start instead of needing weeks of live cycles to
+        // fill a 90-day window. Not every broker can offer this
+        // (fetch_historical_prices defaults to NotImplemented), in
+        // which case this is skipped rather than failing the cycle
+        // over it: live observations populate the window either way,
+        // just more slowly.
+        if correlation_state.samples.is_empty() {
+            match backfill_correlation(broker.as_ref(), primary, secondary).await {
+                Ok(samples) => {
+                    let backfilled = samples.len();
+                    for (primary_close, secondary_close) in samples {
+                        correlation_state = strategy::record_sample(
+                            correlation_state,
+                            primary_close,
+                            secondary_close,
+                            now,
+                        );
+                    }
+                    tracing::info!(%primary, %secondary, backfilled, "seeded correlation window from historical prices");
+                }
+                Err(error) => {
+                    tracing::debug!(%primary, %secondary, %error, "historical correlation backfill unavailable, learning from live data only");
+                }
+            }
+        }
         // Captured before record_sample below stamps this cycle's own
         // now onto it: staleness has to mean "the last invocation that
         // actually got this far was too long ago," not "the update this
@@ -528,7 +541,17 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         }
     }
     if !exits.is_empty() {
-        open_positions = broker.list_open_positions().await?;
+        // Reconciling here (not just re-listing) is the "after fills"
+        // half of the original spec's requirement; the startup
+        // reconciliation is the other half. The in-memory open_positions
+        // from just before this closed, not another read of the cursor
+        // file, is the locally-known baseline: the cursor log is an
+        // append-only history that never marks an old entry closed, so
+        // reading it back here would permanently misflag every position
+        // that ever closed as still "locally known" long after it
+        // stopped being true.
+        open_positions =
+            reconcile_and_notify(broker.as_ref(), &open_positions, notifier.as_ref()).await?;
         for position in &open_positions {
             positions_cursor.append(position).await?;
         }
@@ -759,13 +782,19 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                         .map(|q| q.bid)
                         .unwrap_or(fallback_price),
                 };
-                let stop_loss_price = match signal.direction {
-                    Direction::Buy => entry_price - dec!(0.0050),
-                    Direction::Sell => entry_price + dec!(0.0050),
-                };
+                let stop_loss_price = stop_loss_level(&state.divergence_inputs, &signal, secondary);
+                let stop_distance = (entry_price - stop_loss_price).abs();
+                // The strategy only specifies where the stop goes; the
+                // target isn't part of that rule. Keeping it at this
+                // codebase's own already-documented 1:3 risk-reward (see
+                // monitor.rs's module doc) means the target scales with
+                // whatever the buffer-based stop distance turns out to
+                // be this cycle, rather than staying a fixed pip amount
+                // that would silently drift away from 1:3 now that the
+                // stop itself is no longer fixed.
                 let take_profit_price = match signal.direction {
-                    Direction::Buy => entry_price + dec!(0.0150),
-                    Direction::Sell => entry_price - dec!(0.0150),
+                    Direction::Buy => entry_price + stop_distance * dec!(3),
+                    Direction::Sell => entry_price - stop_distance * dec!(3),
                 };
 
                 // Exposure already open on this pair-set's *other* pair,
@@ -846,7 +875,13 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                         ))
                         .await;
 
-                    open_positions = broker.list_open_positions().await?;
+                    // Same reasoning as the exits-loop reconciliation
+                    // above: the in-memory open_positions, not the raw
+                    // cursor log, is the correct locally-known baseline
+                    // here.
+                    open_positions =
+                        reconcile_and_notify(broker.as_ref(), &open_positions, notifier.as_ref())
+                            .await?;
                     for position in &open_positions {
                         positions_cursor.append(position).await?;
                     }
@@ -869,6 +904,102 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     )
     .await;
     Ok(())
+}
+
+/// Runs reconciliation against whatever the broker reports as open right
+/// now, logging and notifying on any mismatch, and returns the
+/// reconciled position list. Used at startup, and per the original
+/// spec's "reconcile after fills" requirement, again immediately after
+/// every fill (an entry or an exit) rather than only ever catching a
+/// problem at the next invocation's startup reconciliation. A fill is
+/// exactly the kind of event that could introduce a local/broker
+/// mismatch (a submit_order response lost after the order actually
+/// went through, say), so it's the moment reconciling again is worth
+/// the extra broker round trip.
+async fn reconcile_and_notify(
+    broker: &dyn BrokerAdapter,
+    locally_known_positions: &[Position],
+    notifier: &dyn daemon::Notifier,
+) -> anyhow::Result<Vec<Position>> {
+    let report = reconcile(broker, locally_known_positions).await?;
+    if !report.is_clean() {
+        tracing::warn!(
+            orphaned = report.orphaned_locally.len(),
+            adopted = report.unknown_to_local.len(),
+            "reconciliation found a mismatch"
+        );
+        notifier
+            .notify(&format!(
+                "oboobot: reconciliation mismatch (orphaned={}, adopted={})",
+                report.orphaned_locally.len(),
+                report.unknown_to_local.len()
+            ))
+            .await;
+    } else {
+        tracing::debug!(
+            known_positions = locally_known_positions.len(),
+            "reconciliation clean"
+        );
+    }
+    Ok(apply_reconciliation(&report))
+}
+
+/// The stop-loss level for a new position, per the strategy's own rule:
+/// always the previous cycle's high or low that was *not* taken out, on
+/// the asset actually being traded (the one that held, not the one
+/// that swept). A Buy's stop goes at that buffer's low; a Sell's stop
+/// goes at that buffer's high. Tier1 signals come from the daily
+/// buffer, Tier2 from the session buffer; a Double signal agrees on
+/// both, but their numeric levels aren't necessarily identical, so
+/// daily is used for Double too, the same tie-break `evaluate_smt`
+/// itself already uses when daily and session disagree.
+fn stop_loss_level(
+    divergence_inputs: &DivergenceInputs,
+    signal: &TradeSignal,
+    secondary_pair: &str,
+) -> Decimal {
+    let is_secondary = signal.pair == secondary_pair;
+    let buffer = match (signal.tier, is_secondary) {
+        (Tier::Tier2, false) => divergence_inputs.session_primary_buffer,
+        (Tier::Tier2, true) => divergence_inputs.session_secondary_buffer,
+        (_, false) => divergence_inputs.daily_primary_buffer,
+        (_, true) => divergence_inputs.daily_secondary_buffer,
+    };
+    match signal.direction {
+        Direction::Buy => buffer.low,
+        Direction::Sell => buffer.high,
+    }
+}
+
+/// Fetches 90 days of historical daily closes for both `primary` and
+/// `secondary` and pairs them up by index (oldest first, matching what
+/// `fetch_historical_prices` promises) into the (primary, secondary)
+/// tuples `strategy::record_sample` expects. If the two series come
+/// back different lengths, only pairs up to the shorter one: a same-day
+/// mismatch is possible if the two symbols don't share identical
+/// trading calendars, and there's no way to know which days actually
+/// lined up, so it's more honest to under-seed than to risk pairing a
+/// primary close against the wrong day's secondary close.
+async fn backfill_correlation(
+    broker: &dyn BrokerAdapter,
+    primary: &str,
+    secondary: &str,
+) -> anyhow::Result<Vec<(Decimal, Decimal)>> {
+    const BACKFILL_DAYS: u32 = 90;
+    let primary_history = broker
+        .fetch_historical_prices(primary, BACKFILL_DAYS)
+        .await?;
+    let secondary_history = broker
+        .fetch_historical_prices(secondary, BACKFILL_DAYS)
+        .await?;
+    if primary_history.len() != secondary_history.len() {
+        tracing::debug!(
+            %primary, %secondary,
+            primary_days = primary_history.len(), secondary_days = secondary_history.len(),
+            "historical price series lengths didn't match, pairing only up to the shorter one"
+        );
+    }
+    Ok(primary_history.into_iter().zip(secondary_history).collect())
 }
 
 /// Load the persisted True Open level for `timeframe`, capturing a fresh
@@ -1151,13 +1282,11 @@ async fn run_cycle(
                     .map(|q| q.bid)
                     .unwrap_or(dec!(1.10000)),
             };
-            let stop_loss_price = match signal.direction {
-                Direction::Buy => entry_price - dec!(0.0050),
-                Direction::Sell => entry_price + dec!(0.0050),
-            };
+            let stop_loss_price = stop_loss_level(&inputs, &signal, secondary_pair);
+            let stop_distance = (entry_price - stop_loss_price).abs();
             let take_profit_price = match signal.direction {
-                Direction::Buy => entry_price + dec!(0.0150),
-                Direction::Sell => entry_price - dec!(0.0150),
+                Direction::Buy => entry_price + stop_distance * dec!(3),
+                Direction::Sell => entry_price - stop_distance * dec!(3),
             };
 
             let context = risk::RiskContext {
@@ -1219,4 +1348,112 @@ async fn run_cycle(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stop_loss_level_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+    use strategy::BufferLevels;
+    use uuid::Uuid;
+
+    fn buffer(low: rust_decimal::Decimal, high: rust_decimal::Decimal) -> BufferLevels {
+        BufferLevels { low, high }
+    }
+
+    fn sample_inputs() -> DivergenceInputs {
+        DivergenceInputs {
+            primary_price: dec!(1.2000),   // GBPUSD
+            secondary_price: dec!(1.1000), // EURUSD
+            daily_primary_buffer: buffer(dec!(1.1950), dec!(1.2050)),
+            daily_secondary_buffer: buffer(dec!(1.0950), dec!(1.1050)),
+            session_primary_buffer: buffer(dec!(1.1980), dec!(1.2020)),
+            session_secondary_buffer: buffer(dec!(1.0980), dec!(1.1020)),
+        }
+    }
+
+    fn signal(pair: &str, direction: Direction, tier: Tier) -> TradeSignal {
+        TradeSignal {
+            signal_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            pair: pair.to_string(),
+            direction,
+            tier,
+            strength: dec!(0.8),
+            confidence: dec!(0.8),
+            valid_until: chrono::Utc::now(),
+            originating_snapshot_id: Uuid::new_v4(),
+        }
+    }
+
+    // The four cases from the strategy spec, given GBPUSD as primary and
+    // EURUSD as secondary: whichever asset held (the one actually
+    // traded) gets its stop at the previous cycle's un-swept level.
+
+    #[test]
+    fn case_1_buy_eurusd_stops_at_eurusds_own_daily_low() {
+        // EURUSD (secondary) does not take out its low, GBPUSD (primary)
+        // does: buy EURUSD, stop at EURUSD's low that wasn't taken out.
+        let inputs = sample_inputs();
+        let sig = signal("EURUSD", Direction::Buy, Tier::Tier1);
+        assert_eq!(
+            stop_loss_level(&inputs, &sig, "EURUSD"),
+            inputs.daily_secondary_buffer.low
+        );
+    }
+
+    #[test]
+    fn case_2_buy_gbpusd_stops_at_gbpusds_own_daily_low() {
+        // GBPUSD (primary) does not take out its low, EURUSD (secondary)
+        // does: buy GBPUSD, stop at GBPUSD's low that wasn't taken out.
+        let inputs = sample_inputs();
+        let sig = signal("GBPUSD", Direction::Buy, Tier::Tier1);
+        assert_eq!(
+            stop_loss_level(&inputs, &sig, "EURUSD"),
+            inputs.daily_primary_buffer.low
+        );
+    }
+
+    #[test]
+    fn case_3_sell_gbpusd_stops_at_gbpusds_own_daily_high() {
+        // The sell-side mirror: GBPUSD held (didn't take out the high),
+        // EURUSD swept it. Sell GBPUSD, stop at GBPUSD's high.
+        let inputs = sample_inputs();
+        let sig = signal("GBPUSD", Direction::Sell, Tier::Tier1);
+        assert_eq!(
+            stop_loss_level(&inputs, &sig, "EURUSD"),
+            inputs.daily_primary_buffer.high
+        );
+    }
+
+    #[test]
+    fn case_4_sell_eurusd_stops_at_eurusds_own_daily_high() {
+        let inputs = sample_inputs();
+        let sig = signal("EURUSD", Direction::Sell, Tier::Tier1);
+        assert_eq!(
+            stop_loss_level(&inputs, &sig, "EURUSD"),
+            inputs.daily_secondary_buffer.high
+        );
+    }
+
+    #[test]
+    fn tier2_signals_use_the_session_buffer_not_daily() {
+        let inputs = sample_inputs();
+        let sig = signal("GBPUSD", Direction::Buy, Tier::Tier2);
+        assert_eq!(
+            stop_loss_level(&inputs, &sig, "EURUSD"),
+            inputs.session_primary_buffer.low
+        );
+    }
+
+    #[test]
+    fn double_tier_uses_the_daily_buffer_same_as_tier1() {
+        let inputs = sample_inputs();
+        let sig = signal("EURUSD", Direction::Sell, Tier::Double);
+        assert_eq!(
+            stop_loss_level(&inputs, &sig, "EURUSD"),
+            inputs.daily_secondary_buffer.high
+        );
+    }
 }

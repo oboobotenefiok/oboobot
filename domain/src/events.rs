@@ -102,7 +102,10 @@ impl Event {
     /// real channels plus a biased `select!`, not just a sort by this
     /// flag on a single queue).
     pub fn is_priority(&self) -> bool {
-        matches!(self, Event::Order(_) | Event::Shutdown { .. } | Event::Health(_))
+        matches!(
+            self,
+            Event::Order(_) | Event::Shutdown { .. } | Event::Health(_)
+        )
     }
 }
 

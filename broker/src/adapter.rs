@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use domain::{BrokerSnapshot, Order, OrderRequest, Position, Usd};
+use rust_decimal::Decimal;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -104,6 +105,26 @@ pub trait BrokerAdapter: Send + Sync {
     async fn list_open_positions(&self) -> Result<Vec<Position>, BrokerError>;
 
     async fn list_open_orders(&self) -> Result<Vec<Order>, BrokerError>;
+
+    /// Historical daily closes for `pair`, oldest first, going back
+    /// `days` days from now. Used to backfill a fresh correlation window
+    /// so it doesn't have to learn purely from live observations; see
+    /// `strategy::correlation`. Defaults to `NotImplemented` rather than
+    /// an empty `Vec`, so "this broker/product combination genuinely has
+    /// no historical data to offer" stays distinguishable from "the
+    /// request succeeded but returned nothing." Adapters that can offer
+    /// this override it; the default means the ones that can't don't
+    /// need to change at all.
+    async fn fetch_historical_prices(
+        &self,
+        pair: &str,
+        days: u32,
+    ) -> Result<Vec<Decimal>, BrokerError> {
+        let _ = (pair, days);
+        Err(BrokerError::NotImplemented(
+            "fetch_historical_prices is not implemented for this broker".to_string(),
+        ))
+    }
 
     fn capabilities(&self) -> BrokerCapabilities;
 

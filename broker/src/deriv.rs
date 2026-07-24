@@ -210,6 +210,86 @@ impl DerivClient {
     pub async fn authorize(&self, token: &str) -> Result<Value, BrokerError> {
         self.call(json!({ "authorize": token })).await
     }
+
+    /// Same request/response round trip as `call`, retried with
+    /// exponential backoff on transient failures. This is deliberately
+    /// scoped to individual requests over an already-open connection,
+    /// not a reconnect-with-backoff loop for the socket itself: this
+    /// module's own doc comment already explains why that's out of
+    /// scope here (a short-lived process where the next scheduled
+    /// invocation is the retry for a dead connection), and that
+    /// reasoning doesn't change just because individual requests can
+    /// now retry.
+    ///
+    /// Only call this for read-only requests: `portfolio`,
+    /// `proposal_open_contract`, `ticks`, `proposal`, `balance`,
+    /// `authorize`. Never for `buy` or `sell`. If one of those reaches
+    /// Deriv and executes but the response is what's lost, blindly
+    /// retrying would risk placing (or closing) the same contract
+    /// twice; a failure there stays fail-fast, exactly as before this
+    /// existed, and reconciliation is what settles the true state
+    /// afterward.
+    pub async fn call_with_retry(&self, request: Value) -> Result<Value, BrokerError> {
+        const MAX_ATTEMPTS: u32 = 4;
+
+        let mut attempt: u32 = 0;
+        loop {
+            match self.call(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let out_of_attempts = attempt + 1 >= MAX_ATTEMPTS;
+                    if out_of_attempts || !is_retryable(&error) {
+                        return Err(error);
+                    }
+
+                    let delay = backoff_delay(attempt, &error);
+                    tracing::warn!(
+                        %error, attempt, delay_ms = delay.as_millis(),
+                        "retrying after a transient broker failure"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a failed `call()` is worth retrying at all. `Timeout` and
+/// `ConnectionFailed` are exactly the transient, likely-to-clear-on-
+/// their-own failures exponential backoff exists for. `RateLimited` is
+/// too, in the sense that waiting genuinely helps, though it's handled
+/// on its own schedule below rather than the exponential one.
+/// `MalformedResponse`, `Rejected`, and `NotImplemented` all mean the
+/// request was understood and answered (or deliberately refused);
+/// retrying the exact same request wouldn't produce a different
+/// outcome, so those propagate immediately instead.
+fn is_retryable(error: &BrokerError) -> bool {
+    matches!(
+        error,
+        BrokerError::Timeout(_) | BrokerError::ConnectionFailed(_) | BrokerError::RateLimited(_)
+    )
+}
+
+/// How long to wait before the next attempt, given how many have
+/// already happened. Deriv's `RateLimited` carries its own suggested
+/// wait; honoring that instead of guessing is more correct, and more
+/// polite, than picking our own number. Anything else backs off
+/// exponentially from `BASE_DELAY`, capped at `MAX_DELAY`. No jitter:
+/// this is a single-instance daemon woken by a cron schedule, not a
+/// fleet of clients that could all retry in lockstep, so there's no
+/// thundering-herd problem here for jitter to solve.
+fn backoff_delay(attempt: u32, error: &BrokerError) -> Duration {
+    const BASE_DELAY: Duration = Duration::from_secs(1);
+    const MAX_DELAY: Duration = Duration::from_secs(30);
+
+    if let BrokerError::RateLimited(retry_after_ms) = error {
+        Duration::from_millis(*retry_after_ms)
+    } else {
+        BASE_DELAY
+            .saturating_mul(2u32.saturating_pow(attempt))
+            .min(MAX_DELAY)
+    }
 }
 
 impl Drop for DerivClient {
@@ -246,7 +326,10 @@ impl DerivAdapter {
     /// and no ongoing subscription to remember to tear down, which suits
     /// a process that's about to exit anyway.
     async fn fetch_tick(&self, symbol: &str) -> Result<rust_decimal::Decimal, BrokerError> {
-        let response = self.client.call(json!({ "ticks": symbol })).await?;
+        let response = self
+            .client
+            .call_with_retry(json!({ "ticks": symbol }))
+            .await?;
         let quote = response
             .get("tick")
             .and_then(|t| t.get("quote"))
@@ -279,7 +362,7 @@ impl DerivAdapter {
     ) -> Result<Option<domain::Position>, BrokerError> {
         let response = self
             .client
-            .call(json!({ "proposal_open_contract": 1, "contract_id": contract_id }))
+            .call_with_retry(json!({ "proposal_open_contract": 1, "contract_id": contract_id }))
             .await?;
         let detail = response.get("proposal_open_contract").ok_or_else(|| {
             BrokerError::MalformedResponse(
@@ -458,7 +541,9 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
             });
         }
 
-        let proposal = self.client.call(proposal_params).await?;
+        // Read-only: a lost proposal response costs nothing to retry,
+        // unlike the buy call two lines down.
+        let proposal = self.client.call_with_retry(proposal_params).await?;
         let proposal_id = proposal
             .get("proposal")
             .and_then(|p| p.get("id"))
@@ -476,6 +561,10 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
                 )
             })?;
 
+        // Deliberately plain call(), not call_with_retry(): if this
+        // reaches Deriv and executes but the response is what's lost,
+        // retrying would risk buying the same contract twice. A failure
+        // here propagates immediately, same as before retry existed.
         let buy_response = self
             .client
             .call(json!({ "buy": proposal_id, "price": ask_price }))
@@ -534,6 +623,8 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
         // decode it back rather than maintaining a separate lookup table.
         let contract_id = position_id.as_u128() as u64;
 
+        // Same reasoning as buy above: deliberately plain call(), never
+        // retried, so a lost response can't risk a duplicate close.
         let response = self
             .client
             .call(json!({ "sell": contract_id, "price": 0 }))
@@ -578,7 +669,7 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
     }
 
     async fn get_account_equity(&self) -> Result<domain::Usd, BrokerError> {
-        let response = self.client.call(json!({ "balance": 1 })).await?;
+        let response = self.client.call_with_retry(json!({ "balance": 1 })).await?;
         let balance = response
             .get("balance")
             .and_then(|b| b.get("balance"))
@@ -605,7 +696,10 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
     /// same account, some other Deriv product) is skipped rather than
     /// force-fit into a `Position` it doesn't actually describe.
     async fn list_open_positions(&self) -> Result<Vec<domain::Position>, BrokerError> {
-        let portfolio = self.client.call(json!({ "portfolio": 1 })).await?;
+        let portfolio = self
+            .client
+            .call_with_retry(json!({ "portfolio": 1 }))
+            .await?;
         let contracts = portfolio
             .get("portfolio")
             .and_then(|p| p.get("contracts"))
@@ -671,6 +765,59 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
         Ok(Vec::new())
     }
 
+    async fn fetch_historical_prices(
+        &self,
+        pair: &str,
+        days: u32,
+    ) -> Result<Vec<rust_decimal::Decimal>, BrokerError> {
+        let symbol = to_deriv_symbol(pair);
+        let end = chrono::Utc::now().timestamp();
+        let start = end - i64::from(days) * 86_400;
+
+        // Read-only, so retried the same as any other market-data call.
+        let response = self
+            .client
+            .call_with_retry(json!({
+                "ticks_history": symbol,
+                "style": "candles",
+                "granularity": 86_400,
+                "start": start,
+                "end": "latest",
+                "adjust_start_time": 1,
+            }))
+            .await?;
+
+        let candles = response
+            .get("candles")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                BrokerError::MalformedResponse(
+                    "ticks_history response had no usable candles array".to_string(),
+                )
+            })?;
+
+        candles
+            .iter()
+            .map(|candle| {
+                candle
+                    .get("close")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| {
+                        BrokerError::MalformedResponse(
+                            "a candle had no usable close price".to_string(),
+                        )
+                    })
+                    .and_then(|close| {
+                        rust_decimal::Decimal::try_from(close).map_err(|_| {
+                            BrokerError::MalformedResponse(
+                                "a candle's close price was not a finite number".to_string(),
+                            )
+                        })
+                    })
+            })
+            .collect()
+    }
+
     fn capabilities(&self) -> crate::adapter::BrokerCapabilities {
         crate::adapter::BrokerCapabilities {
             market_orders: true,
@@ -696,6 +843,50 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_connection_and_rate_limit_errors_are_retryable() {
+        assert!(is_retryable(&BrokerError::Timeout(5000)));
+        assert!(is_retryable(&BrokerError::ConnectionFailed(
+            "dropped".to_string()
+        )));
+        assert!(is_retryable(&BrokerError::RateLimited(2000)));
+    }
+
+    #[test]
+    fn malformed_rejected_and_not_implemented_are_not_retryable() {
+        // These all mean the request was understood and answered (or
+        // deliberately refused): retrying the exact same request
+        // wouldn't produce a different result.
+        assert!(!is_retryable(&BrokerError::MalformedResponse(
+            "bad".to_string()
+        )));
+        assert!(!is_retryable(&BrokerError::Rejected("no".to_string())));
+        assert!(!is_retryable(&BrokerError::NotImplemented(
+            "nope".to_string()
+        )));
+    }
+
+    #[test]
+    fn backoff_delay_doubles_each_attempt_up_to_the_cap() {
+        let error = BrokerError::Timeout(5000);
+        assert_eq!(backoff_delay(0, &error), Duration::from_secs(1));
+        assert_eq!(backoff_delay(1, &error), Duration::from_secs(2));
+        assert_eq!(backoff_delay(2, &error), Duration::from_secs(4));
+        assert_eq!(backoff_delay(3, &error), Duration::from_secs(8));
+        // 1 * 2^10 would be far past the 30s cap; confirm it's clamped.
+        assert_eq!(backoff_delay(10, &error), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_delay_honors_deriv_own_rate_limit_hint_over_the_exponential_schedule() {
+        // 45 seconds is longer than the exponential schedule would ever
+        // produce on its own (capped at 30s); Deriv's own hint should
+        // still win, since it's the more authoritative answer.
+        let error = BrokerError::RateLimited(45_000);
+        assert_eq!(backoff_delay(0, &error), Duration::from_millis(45_000));
+        assert_eq!(backoff_delay(3, &error), Duration::from_millis(45_000));
+    }
 
     #[test]
     fn symbol_mapping_adds_the_frx_prefix() {
