@@ -4,6 +4,11 @@
 # written directly into this file, since this file is meant to live in
 # an open-source repo.
 
+# Config schema version. Only ever needs to change if a future release
+# notes a breaking change to this file's shape; omitting it entirely is
+# also fine and is read the same as version = 1.
+version = 1
+
 [risk]
 base_risk_percent = 1.0
 max_risk_percent = 5.0

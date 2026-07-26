@@ -51,7 +51,12 @@ pub enum BrokerError {
     /// because doing that correctly means confirming exact endpoint URLs,
     /// auth flows, and payload shapes against each broker's live docs,
     /// which isn't something to guess at. See `broker::stubs`.
-    #[error("{0} is not yet implemented against a live broker")]
+    /// The message should be a complete, self-contained explanation on
+    /// its own: this variant's Display shows it verbatim, with nothing
+    /// appended, since there's no fixed wording that reads naturally
+    /// after every possible call site's message (some name a bare
+    /// method, some already explain a full reason why).
+    #[error("{0}")]
     NotImplemented(String),
 }
 

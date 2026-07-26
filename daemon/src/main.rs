@@ -43,7 +43,7 @@ use session_time::HolidayProvider;
 use strategy::{generate_signal, BufferLevels, DivergenceInputs, SignalOutcome, TradeTarget};
 use uuid::Uuid;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "oboobot",
     about = "QuarterlyTheory_SMT_Trader: an SMT-divergence trading daemon"
@@ -76,6 +76,15 @@ struct Cli {
     /// Ignores every other flag.
     #[arg(long)]
     demo: bool,
+
+    /// Replay this many days of history through the real cycle logic
+    /// instead of trading live. Fetches historical daily closes for the
+    /// first configured pair-set via --broker (which must be able to
+    /// offer them; MockBroker cannot), then steps through them one
+    /// simulated day at a time. Ignores --force; a replay run always
+    /// evaluates every simulated day as if it were inside the window.
+    #[arg(long)]
+    replay_days: Option<u32>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -94,13 +103,59 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    spawn_shutdown_logger();
+
     let cli = Cli::parse();
 
     if cli.demo {
         return run_demo().await;
     }
 
-    run_real_cycle(cli).await
+    if let Some(days) = cli.replay_days {
+        return run_replay(cli, days).await;
+    }
+
+    let broker: Box<dyn BrokerAdapter> = match cli.broker {
+        BrokerKind::Mock => Box::new(MockBroker::new(
+            Usd::from_decimal(dec!(10000)),
+            dec!(1.10000),
+        )),
+        BrokerKind::Deriv => Box::new(DerivAdapter::connect_from_env().await?),
+        BrokerKind::Bybit => Box::new(BybitAdapter::from_env()?),
+    };
+    run_real_cycle(cli, &session_time::SystemClock, broker.as_ref()).await
+}
+
+/// Logs a SIGTERM if one arrives, but never interrupts the in-flight
+/// cycle to act on it. An earlier attempt at SIGTERM handling here
+/// cancelled the running cycle outright (via `tokio::select!` racing
+/// the signal against the cycle's own future), which risked abandoning
+/// a broker call mid-flight: an order already sent to Deriv but whose
+/// response never got processed, leaving local and broker state out of
+/// sync in exactly the way reconciliation exists to catch, not cause.
+/// GitHub Actions gives a grace period after SIGTERM before SIGKILL
+/// follows, and a single invocation's cycle is short, so simply letting
+/// it run to completion while logging that a shutdown was requested is
+/// both safer and just as useful for a batch job like this one. Unix
+/// only (`tokio::signal::unix`), which matches every other assumption
+/// this codebase already makes about where it runs (GitHub Actions'
+/// Ubuntu runners); if the signal listener itself fails to install,
+/// that's not worth failing the whole process over, so it's just
+/// silently skipped.
+fn spawn_shutdown_logger() {
+    tokio::spawn(async {
+        let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            return;
+        };
+        term.recv().await;
+        tracing::warn!(
+            "received SIGTERM; letting the in-flight cycle run to completion rather than \
+             interrupting it, since cancelling mid-cycle risks abandoning a broker call in an \
+             ambiguous state"
+        );
+    });
 }
 
 /// Writes the status snapshot. Called from every exit path in
@@ -154,7 +209,11 @@ struct PairCycleState {
 }
 
 /// The real, deployable path.
-async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
+async fn run_real_cycle(
+    cli: Cli,
+    clock: &dyn session_time::Clock,
+    broker: &dyn BrokerAdapter,
+) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&cli.state_dir).await?;
     let status_snap: SnapshotFile<StatusSnapshot> =
         SnapshotFile::new(cli.state_dir.join("status.json"));
@@ -187,20 +246,11 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     let daily_true_open_snap: SnapshotFile<session_time::TrueOpenLevel> =
         SnapshotFile::new(cli.state_dir.join("true_open_daily.json"));
 
-    let broker: Box<dyn BrokerAdapter> = match cli.broker {
-        BrokerKind::Mock => Box::new(MockBroker::new(
-            Usd::from_decimal(dec!(10000)),
-            dec!(1.10000),
-        )),
-        BrokerKind::Deriv => Box::new(DerivAdapter::connect_from_env().await?),
-        BrokerKind::Bybit => Box::new(BybitAdapter::from_env()?),
-    };
-
     // Reconciliation always runs first: what does local state say is
     // open, and does the broker agree?
     let locally_known_positions = positions_cursor.read_all().await?;
     let mut open_positions =
-        reconcile_and_notify(broker.as_ref(), &locally_known_positions, notifier.as_ref()).await?;
+        reconcile_and_notify(broker, &locally_known_positions, notifier.as_ref()).await?;
 
     // One snapshot covers every pair-set configured this cycle: the
     // union of each pair-set's primary and secondary, deduplicated, so a
@@ -243,7 +293,7 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         }
     };
 
-    let now = chrono::Utc::now();
+    let now = clock.now();
     // Quarterly Theory's Tuesday risk-doubling is an NY-calendar-day
     // concept, like every other session boundary this strategy cares
     // about, so it's computed in NY local time rather than UTC: the two
@@ -361,7 +411,7 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         // over it: live observations populate the window either way,
         // just more slowly.
         if correlation_state.samples.is_empty() {
-            match backfill_correlation(broker.as_ref(), primary, secondary).await {
+            match backfill_correlation(broker, primary, secondary).await {
                 Ok(samples) => {
                     let backfilled = samples.len();
                     for (primary_close, secondary_close) in samples {
@@ -550,8 +600,7 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
         // reading it back here would permanently misflag every position
         // that ever closed as still "locally known" long after it
         // stopped being true.
-        open_positions =
-            reconcile_and_notify(broker.as_ref(), &open_positions, notifier.as_ref()).await?;
+        open_positions = reconcile_and_notify(broker, &open_positions, notifier.as_ref()).await?;
         for position in &open_positions {
             positions_cursor.append(position).await?;
         }
@@ -880,8 +929,7 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
                     // cursor log, is the correct locally-known baseline
                     // here.
                     open_positions =
-                        reconcile_and_notify(broker.as_ref(), &open_positions, notifier.as_ref())
-                            .await?;
+                        reconcile_and_notify(broker, &open_positions, notifier.as_ref()).await?;
                     for position in &open_positions {
                         positions_cursor.append(position).await?;
                     }
@@ -906,7 +954,128 @@ async fn run_real_cycle(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs reconciliation against whatever the broker reports as open right
+/// Loads `days` of historical daily closes for the first configured
+/// pair-set, then steps through them one simulated day at a time,
+/// calling the exact same `run_real_cycle` logic each step with a
+/// `ManualClock` and a `ReplayBroker` standing in for wall-clock time
+/// and a live connection. Scoped to one pair-set for this first
+/// version, with no slippage model beyond filling exactly at each
+/// simulated day's closing price; see
+/// `docs/adr/0004-replay-engine-design.md` for the full design and what
+/// else is deliberately left out of it.
+///
+/// Runs against an entirely separate `<state_dir>/replay` directory,
+/// never the real state directory: replay's decisions, positions, and
+/// buffers must never mix with (or corrupt) real trading state, and a
+/// fresh replay run always starts clean rather than resuming a
+/// previous one's.
+async fn run_replay(cli: Cli, days: u32) -> anyhow::Result<()> {
+    let config = Config::load(&cli.config).await?;
+    let Some(pair_config) = config.pairs.first().cloned() else {
+        anyhow::bail!("no pairs configured to replay");
+    };
+    if config.pairs.len() > 1 {
+        tracing::warn!(
+            pairs_configured = config.pairs.len(),
+            replaying = %format!("{}/{}", pair_config.primary, pair_config.secondary),
+            "replay only evaluates the first configured pair-set in this first version"
+        );
+    }
+
+    // Historical data comes from whichever broker --broker names.
+    // MockBroker and BybitAdapter both fall back to
+    // BrokerAdapter::fetch_historical_prices's NotImplemented default,
+    // so a real replay run needs --broker deriv even though nothing is
+    // traded live.
+    let source_broker: Box<dyn BrokerAdapter> = match cli.broker {
+        BrokerKind::Mock => Box::new(MockBroker::new(
+            Usd::from_decimal(dec!(10000)),
+            dec!(1.10000),
+        )),
+        BrokerKind::Deriv => Box::new(DerivAdapter::connect_from_env().await?),
+        BrokerKind::Bybit => Box::new(BybitAdapter::from_env()?),
+    };
+    let primary_history = source_broker
+        .fetch_historical_prices(&pair_config.primary, days)
+        .await?;
+    let secondary_history = source_broker
+        .fetch_historical_prices(&pair_config.secondary, days)
+        .await?;
+
+    let mut bars = BTreeMap::new();
+    bars.insert(pair_config.primary.clone(), primary_history);
+    bars.insert(pair_config.secondary.clone(), secondary_history);
+
+    let replay_state_dir = cli.state_dir.join("replay");
+    // A fresh run every time, not a resumed one: replaying the same
+    // window twice should give the same answer both times, not one
+    // that depends on leftover state from the last run.
+    let _ = tokio::fs::remove_dir_all(&replay_state_dir).await;
+    tokio::fs::create_dir_all(&replay_state_dir).await?;
+
+    let starting_equity = Usd::from_decimal(dec!(10000));
+    let replay_broker = daemon::ReplayBroker::new(
+        replay_state_dir.join("replay_broker_state.json"),
+        bars,
+        starting_equity,
+    );
+    let bar_count = replay_broker.bar_count();
+    if bar_count == 0 {
+        anyhow::bail!(
+            "no historical data available to replay for {}/{}",
+            pair_config.primary,
+            pair_config.secondary
+        );
+    }
+
+    let clock = session_time::ManualClock::new(
+        chrono::Utc::now() - chrono::Duration::days(i64::from(days)),
+    );
+
+    for bar in 0..bar_count {
+        let mut cycle_cli = cli.clone();
+        cycle_cli.state_dir.clone_from(&replay_state_dir);
+        // Replay always evaluates every simulated day: there is no
+        // real macro-cycle window to be inside or outside of when the
+        // clock isn't real wall-clock time.
+        cycle_cli.force = true;
+
+        run_real_cycle(cycle_cli, &clock, &replay_broker).await?;
+
+        tracing::info!(bar = bar + 1, of = bar_count, "replay day complete");
+        if bar + 1 < bar_count {
+            replay_broker.advance();
+            clock.advance(chrono::Duration::days(1));
+        }
+    }
+
+    let ending_equity = replay_broker.get_account_equity().await?.as_decimal();
+    let decisions_cursor: CursorFile<DecisionRecord> =
+        CursorFile::new(replay_state_dir.join("decisions.cursor"));
+    let decisions = decisions_cursor.read_all().await?;
+    let mut decision_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for decision in &decisions {
+        *decision_counts.entry(decision.outcome.clone()).or_insert(0) += 1;
+    }
+
+    let report = daemon::ReplayReport {
+        pair_set: (pair_config.primary.clone(), pair_config.secondary.clone()),
+        bars_replayed: bar_count,
+        starting_equity: starting_equity.as_decimal(),
+        ending_equity,
+        trades_opened: decision_counts.get("order_submitted").copied().unwrap_or(0),
+        trades_closed: decision_counts.get("position_closed").copied().unwrap_or(0),
+        decision_counts,
+    };
+
+    let report_json = serde_json::to_string_pretty(&report)?;
+    tracing::info!("replay complete");
+    println!("{report_json}");
+    tokio::fs::write(replay_state_dir.join("replay_report.json"), &report_json).await?;
+
+    Ok(())
+}
+
 /// now, logging and notifying on any mismatch, and returns the
 /// reconciled position list. Used at startup, and per the original
 /// spec's "reconcile after fills" requirement, again immediately after
@@ -1043,6 +1212,8 @@ async fn run_demo() -> anyhow::Result<()> {
     let positions_cursor_path = state_dir.join("positions.cursor");
     let _ = tokio::fs::remove_file(&positions_cursor_path).await;
     let positions_cursor: CursorFile<Position> = CursorFile::new(&positions_cursor_path);
+    let recommendations_cursor: CursorFile<daemon::assistant::RecommendationRecord> =
+        CursorFile::new(state_dir.join("recommendations.cursor"));
 
     let locally_known_positions: Vec<Position> = positions_cursor.read_all().await?;
     let report = reconcile(&broker, &locally_known_positions).await?;
@@ -1063,6 +1234,7 @@ async fn run_demo() -> anyhow::Result<()> {
         &health,
         &assistant,
         &positions_cursor,
+        &recommendations_cursor,
         &mut open_positions,
         "GBPUSD",
         "EURUSD",
@@ -1097,6 +1269,7 @@ async fn run_demo() -> anyhow::Result<()> {
         &health,
         &assistant,
         &positions_cursor,
+        &recommendations_cursor,
         &mut open_positions,
         "GBPUSD",
         "EURUSD",
@@ -1131,6 +1304,7 @@ async fn run_demo() -> anyhow::Result<()> {
         &health,
         &assistant,
         &positions_cursor,
+        &recommendations_cursor,
         &mut open_positions,
         "GBPUSD",
         "EURUSD",
@@ -1208,6 +1382,7 @@ async fn run_cycle(
     health: &HealthMonitor,
     assistant: &dyn AssistantEngine,
     cursor: &CursorFile<Position>,
+    recommendations_cursor: &CursorFile<daemon::assistant::RecommendationRecord>,
     open_positions: &mut Vec<Position>,
     primary_pair: &str,
     secondary_pair: &str,
@@ -1227,7 +1402,7 @@ async fn run_cycle(
         .await?;
     let macro_cycle_event = EventEnvelope::new(snapshot.timestamp, Event::MacroCycleStarted);
     for recommendation in assistant.analyze_event(&macro_cycle_event).await {
-        daemon::assistant::record_recommendation(&recommendation);
+        daemon::assistant::record_recommendation(&recommendation, recommendations_cursor).await?;
     }
 
     let outcome = generate_signal(

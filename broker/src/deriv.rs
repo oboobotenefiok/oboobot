@@ -612,7 +612,7 @@ impl crate::adapter::BrokerAdapter for DerivAdapter {
         // this stays NotImplemented rather than being force-fit into a
         // shape Deriv's model doesn't actually have.
         Err(BrokerError::NotImplemented(
-            "DerivAdapter::cancel_order — Multipliers don't have a pending-order concept to cancel"
+            "DerivAdapter::cancel_order: Multipliers don't have a pending-order concept to cancel"
                 .to_string(),
         ))
     }

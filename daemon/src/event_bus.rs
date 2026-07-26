@@ -34,7 +34,11 @@ impl EventBusHandle {
     /// given event kind belongs on.
     pub async fn publish(&self, envelope: EventEnvelope) -> Result<(), EventBusError> {
         let is_priority = envelope.payload.is_priority();
-        let tx = if is_priority { &self.priority_tx } else { &self.ordinary_tx };
+        let tx = if is_priority {
+            &self.priority_tx
+        } else {
+            &self.ordinary_tx
+        };
         tx.send(envelope).await.map_err(|_| EventBusError::Closed)
     }
 }
@@ -68,8 +72,14 @@ pub fn event_bus(capacity: usize) -> (EventBusHandle, EventBusReceiver) {
     let (priority_tx, priority_rx) = mpsc::channel(capacity);
     let (ordinary_tx, ordinary_rx) = mpsc::channel(capacity);
     (
-        EventBusHandle { priority_tx, ordinary_tx },
-        EventBusReceiver { priority_rx, ordinary_rx },
+        EventBusHandle {
+            priority_tx,
+            ordinary_tx,
+        },
+        EventBusReceiver {
+            priority_rx,
+            ordinary_rx,
+        },
     )
 }
 
@@ -93,7 +103,9 @@ mod tests {
             .unwrap();
         // ...then a priority one.
         handle
-            .publish(envelope(Event::Shutdown { reason: "test".to_string() }))
+            .publish(envelope(Event::Shutdown {
+                reason: "test".to_string(),
+            }))
             .await
             .unwrap();
 

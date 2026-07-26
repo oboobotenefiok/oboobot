@@ -51,9 +51,7 @@ impl<C: Clock> Scheduler<C> {
     async fn sleep_until_next_cycle(&self) {
         let now = self.clock.now();
         let next = session_time::next_macro_cycle_after(now);
-        let wait = (next - now)
-            .to_std()
-            .unwrap_or(std::time::Duration::ZERO);
+        let wait = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
         tokio::time::sleep(wait).await;
     }
 }

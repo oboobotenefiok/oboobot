@@ -109,8 +109,28 @@ pub struct NotificationSection {
     pub telegram_chat_id_env: Option<String>,
 }
 
+/// The current config schema version. Bump this whenever a change to
+/// the TOML shape would break an older config file if loaded as-is (a
+/// field renamed, removed, or given new required semantics, not a
+/// backward-compatible addition like every `#[serde(default)]` field
+/// already in this file, those don't need a version bump since an old
+/// config file loads them at their default just fine). Add a migration
+/// path in `Config::load` for whatever the previous version needs to
+/// become this one.
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
+fn default_config_version() -> u32 {
+    // A config file with no version field predates versioning
+    // altogether. Since version 1 is the only version that has ever
+    // existed, that's what an unversioned file actually is, not an
+    // error and not something to guess at.
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
     pub risk: RiskSection,
     pub pairs: Vec<PairConfig>,
     #[serde(default)]
@@ -123,6 +143,7 @@ impl Config {
     /// run before anyone's authored a config.toml.
     pub fn default_config() -> Self {
         Config {
+            version: CURRENT_CONFIG_VERSION,
             risk: RiskSection {
                 base_risk_percent: 1.0,
                 max_risk_percent: 5.0,
@@ -169,6 +190,24 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.version > CURRENT_CONFIG_VERSION {
+            return Err(ConfigError::Invalid(format!(
+                "config.toml declares version {}, but this build only understands up to version {}; \
+                 upgrade the daemon before using this config file",
+                self.version, CURRENT_CONFIG_VERSION
+            )));
+        }
+        if self.version < CURRENT_CONFIG_VERSION {
+            // No migration path exists yet because version 1 is the
+            // only version that has ever existed; this branch is
+            // unreachable today and is what a future version bump's
+            // migration will hook into.
+            tracing::warn!(
+                found = self.version,
+                current = CURRENT_CONFIG_VERSION,
+                "config.toml is an older schema version than this build expects"
+            );
+        }
         if !(0.0..=100.0).contains(&self.risk.max_risk_percent) {
             return Err(ConfigError::Invalid(format!(
                 "risk.max_risk_percent must be between 0 and 100, got {}",
@@ -229,6 +268,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(config.pairs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_config_file_without_a_version_field_defaults_to_version_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        tokio::fs::write(
+            &path,
+            r#"
+            [risk]
+            base_risk_percent = 1.0
+            max_risk_percent = 5.0
+            max_open_positions = 5
+            daily_loss_limit_percent = 5.0
+            weekly_loss_limit_percent = 10.0
+
+            [[pairs]]
+            primary = "EURUSD"
+            secondary = "GBPUSD"
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let config = Config::load(&path).await.unwrap();
+        assert_eq!(config.version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_config_version_newer_than_this_build_understands_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        tokio::fs::write(
+            &path,
+            r#"
+            version = 99
+
+            [risk]
+            base_risk_percent = 1.0
+            max_risk_percent = 5.0
+            max_open_positions = 5
+            daily_loss_limit_percent = 5.0
+            weekly_loss_limit_percent = 10.0
+
+            [[pairs]]
+            primary = "EURUSD"
+            secondary = "GBPUSD"
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let result = Config::load(&path).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

@@ -47,7 +47,10 @@ pub async fn reconcile(
     let broker_positions = broker.list_open_positions().await?;
 
     let broker_ids: HashSet<Uuid> = broker_positions.iter().map(|p| p.position_id).collect();
-    let local_ids: HashSet<Uuid> = locally_known_positions.iter().map(|p| p.position_id).collect();
+    let local_ids: HashSet<Uuid> = locally_known_positions
+        .iter()
+        .map(|p| p.position_id)
+        .collect();
 
     let orphaned_locally = locally_known_positions
         .iter()
@@ -158,7 +161,10 @@ mod tests {
         assert!(report.confirmed.is_empty());
 
         let reconciled = apply_reconciliation(&report);
-        assert!(reconciled.is_empty(), "an orphaned position should not survive reconciliation");
+        assert!(
+            reconciled.is_empty(),
+            "an orphaned position should not survive reconciliation"
+        );
     }
 
     #[tokio::test]
@@ -190,6 +196,10 @@ mod tests {
         assert!(!report.is_clean());
 
         let reconciled = apply_reconciliation(&report);
-        assert_eq!(reconciled.len(), 1, "a broker-confirmed position we didn't know about should be adopted, not discarded");
+        assert_eq!(
+            reconciled.len(),
+            1,
+            "a broker-confirmed position we didn't know about should be adopted, not discarded"
+        );
     }
 }

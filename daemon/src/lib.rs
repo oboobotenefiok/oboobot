@@ -19,9 +19,12 @@ pub mod news;
 pub mod notifications;
 pub mod operations;
 pub mod recovery;
+pub mod replay;
 pub mod scheduler;
 
-pub use assistant::{AssistantEngine, ConfigChangeSuggestion, LoggingAssistant, Recommendation, Severity};
+pub use assistant::{
+    AssistantEngine, ConfigChangeSuggestion, LoggingAssistant, Recommendation, Severity,
+};
 pub use config::{Config, ConfigError, NotificationSection, PairConfig, RiskSection};
 pub use event_bus::{event_bus, EventBusError, EventBusHandle, EventBusReceiver};
 pub use health::{
@@ -30,7 +33,12 @@ pub use health::{
 };
 pub use monitor::{evaluate_exits, ExitDecision};
 pub use news::{should_exit_for_news, NewsProvider, NoNewsProvider};
-pub use notifications::{notifier_from_config, NoopNotifier, Notifier, SlackNotifier, TelegramNotifier};
-pub use operations::{already_entered_this_cycle, kill_switch_engaged, DecisionRecord, StatusSnapshot};
+pub use notifications::{
+    notifier_from_config, NoopNotifier, Notifier, SlackNotifier, TelegramNotifier,
+};
+pub use operations::{
+    already_entered_this_cycle, kill_switch_engaged, DecisionRecord, StatusSnapshot,
+};
 pub use recovery::{apply_reconciliation, reconcile, ReconciliationReport};
+pub use replay::{ReplayBroker, ReplayReport};
 pub use scheduler::Scheduler;

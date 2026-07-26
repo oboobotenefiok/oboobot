@@ -16,7 +16,10 @@ pub struct NoopNotifier;
 #[async_trait]
 impl Notifier for NoopNotifier {
     async fn notify(&self, message: &str) {
-        tracing::debug!(message, "NoopNotifier: notification suppressed (no webhook configured)");
+        tracing::debug!(
+            message,
+            "NoopNotifier: notification suppressed (no webhook configured)"
+        );
     }
 }
 
@@ -27,7 +30,10 @@ pub struct SlackNotifier {
 
 impl SlackNotifier {
     pub fn new(webhook_url: String) -> Self {
-        SlackNotifier { webhook_url, client: reqwest::Client::new() }
+        SlackNotifier {
+            webhook_url,
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -53,7 +59,11 @@ pub struct TelegramNotifier {
 
 impl TelegramNotifier {
     pub fn new(bot_token: String, chat_id: String) -> Self {
-        TelegramNotifier { bot_token, chat_id, client: reqwest::Client::new() }
+        TelegramNotifier {
+            bot_token,
+            chat_id,
+            client: reqwest::Client::new(),
+        }
     }
 }
 

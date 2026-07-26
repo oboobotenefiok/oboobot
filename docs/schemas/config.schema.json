@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "oboobot config.toml",
+  "description": "Structural shape of the daemon's TOML config file (daemon::config::Config), expressed as JSON Schema for documentation purposes. The file itself is TOML, not JSON.",
+  "type": "object",
+  "required": ["risk", "pairs"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "default": 1,
+      "description": "Config schema version. Omitting this entirely is read the same as version = 1. A version newer than the running build's CURRENT_CONFIG_VERSION is rejected at load time."
+    },
+    "risk": {
+      "type": "object",
+      "required": ["base_risk_percent", "max_risk_percent", "max_open_positions", "daily_loss_limit_percent", "weekly_loss_limit_percent"],
+      "properties": {
+        "base_risk_percent": { "type": "number", "description": "Percent of equity risked per trade before any multiplier." },
+        "max_risk_percent": { "type": "number", "description": "Hard ceiling apply_multiplier enforces after the Tuesday/Double-SMT multiplier is applied." },
+        "max_open_positions": { "type": "integer", "minimum": 0 },
+        "daily_loss_limit_percent": { "type": "number" },
+        "weekly_loss_limit_percent": { "type": "number" },
+        "spread_multiplier": { "type": "number", "default": 1.5, "description": "Spread filter rejects a cycle whose current spread exceeds this multiple of the recent rolling average." },
+        "regime_shift_threshold": { "type": "number", "default": 0.20 },
+        "max_exposure_per_currency_percent": { "type": "number", "default": 15.0 },
+        "max_correlation_exposure_percent": { "type": "number", "default": 10.0 },
+        "correlation_exposure_threshold": { "type": "number", "default": 0.7, "description": "Live |Pearson coefficient| at or above which two pairs count as the same correlation cluster for exposure limiting." },
+        "correlation_staleness_minutes": { "type": "integer", "default": 30 },
+        "spread_staleness_minutes": { "type": "integer", "default": 30 },
+        "snapshot_latency_threshold_seconds": { "type": "integer", "default": 120 }
+      }
+    },
+    "pairs": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One entry per correlated pair-set this strategy watches. The real cycle iterates every entry.",
+      "items": {
+        "type": "object",
+        "required": ["primary", "secondary"],
+        "properties": {
+          "primary": { "type": "string", "description": "e.g. \"EURUSD\". Which asset in a divergence ends up trading is decided per cycle by strategy::smt, not fixed by this label." },
+          "secondary": { "type": "string" }
+        }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "description": "Names of environment variables to read secrets from, never the secrets themselves.",
+      "properties": {
+        "slack_webhook_env": { "type": ["string", "null"] },
+        "telegram_bot_token_env": { "type": ["string", "null"] },
+        "telegram_chat_id_env": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

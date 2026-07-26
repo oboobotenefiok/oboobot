@@ -30,7 +30,9 @@ use std::path::Path;
 const MIN_MINUTES_BETWEEN_ENTRIES_SAME_PAIR: i64 = 170;
 
 pub async fn kill_switch_engaged(state_dir: &Path) -> bool {
-    tokio::fs::try_exists(state_dir.join("PAUSED")).await.unwrap_or(false)
+    tokio::fs::try_exists(state_dir.join("PAUSED"))
+        .await
+        .unwrap_or(false)
 }
 
 /// Whether opening a new position on `pair` right now would collide with
@@ -38,10 +40,15 @@ pub async fn kill_switch_engaged(state_dir: &Path) -> bool {
 /// (open or already closed), not just currently-open ones, since a
 /// position that already opened and closed within the same window still
 /// means this window already traded that pair.
-pub fn already_entered_this_cycle(pair: &str, known_positions: &[Position], now: DateTime<Utc>) -> bool {
+pub fn already_entered_this_cycle(
+    pair: &str,
+    known_positions: &[Position],
+    now: DateTime<Utc>,
+) -> bool {
     known_positions.iter().any(|position| {
         position.pair == pair
-            && (now - position.entry_time) < Duration::minutes(MIN_MINUTES_BETWEEN_ENTRIES_SAME_PAIR)
+            && (now - position.entry_time)
+                < Duration::minutes(MIN_MINUTES_BETWEEN_ENTRIES_SAME_PAIR)
     })
 }
 
@@ -55,7 +62,12 @@ pub struct DecisionRecord {
 
 impl DecisionRecord {
     pub fn new(pair: impl Into<String>, outcome: impl Into<String>) -> Self {
-        DecisionRecord { timestamp: Utc::now(), pair: pair.into(), outcome: outcome.into(), detail: None }
+        DecisionRecord {
+            timestamp: Utc::now(),
+            pair: pair.into(),
+            outcome: outcome.into(),
+            detail: None,
+        }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -89,7 +101,11 @@ mod tests {
             signal_id: Uuid::new_v4(),
             pair: pair.to_string(),
             direction: Direction::Buy,
-            legs: vec![FillLeg { price: dec!(1.1000), size: dec!(1.0), filled_at: entry_time }],
+            legs: vec![FillLeg {
+                price: dec!(1.1000),
+                size: dec!(1.0),
+                filled_at: entry_time,
+            }],
             entry_price: dec!(1.1000),
             current_price: dec!(1.1000),
             unrealized_pnl: Decimal::ZERO,
@@ -112,7 +128,9 @@ mod tests {
     #[tokio::test]
     async fn kill_switch_engages_when_the_paused_file_exists() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("PAUSED"), "").await.unwrap();
+        tokio::fs::write(dir.path().join("PAUSED"), "")
+            .await
+            .unwrap();
         assert!(kill_switch_engaged(dir.path()).await);
     }
 

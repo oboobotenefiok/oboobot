@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TradeSignal",
+  "description": "domain::types::TradeSignal, produced by strategy::generate_signal once a divergence resolves to a concrete pair and passes the True Open gate.",
+  "type": "object",
+  "required": [
+    "signal_id", "trace_id", "timestamp", "pair", "direction", "tier",
+    "strength", "confidence", "valid_until", "originating_snapshot_id"
+  ],
+  "properties": {
+    "signal_id": { "type": "string", "format": "uuid" },
+    "trace_id": { "type": "string", "format": "uuid", "description": "Correlates this signal through to whatever order, position, or rejection it leads to." },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "pair": {
+      "type": "string",
+      "example": "EURUSD",
+      "description": "The resolved concrete pair: whichever of primary/secondary strategy::smt::TradeTarget identified as the asset that held (the one to trade), not necessarily the pair-set's configured 'primary'."
+    },
+    "direction": { "type": "string", "enum": ["Buy", "Sell"] },
+    "tier": {
+      "type": "string",
+      "enum": ["Tier1", "Tier2", "Double"],
+      "description": "Tier1: daily timeframe only. Tier2: session timeframe only. Double: both timeframes agree on both target and direction; triggers the 2x risk multiplier."
+    },
+    "strength": { "type": "string", "description": "Decimal as string, 0.0-1.0." },
+    "confidence": { "type": "string", "description": "Decimal as string, 0.0-1.0." },
+    "valid_until": { "type": "string", "format": "date-time" },
+    "originating_snapshot_id": { "type": "string", "format": "uuid", "description": "Ties this signal back to the specific BrokerSnapshot it was computed from." }
+  }
+}

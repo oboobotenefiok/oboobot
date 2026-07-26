@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Position",
+  "description": "domain::types::Position, as persisted to positions.cursor (one JSON object per line) and reported by BrokerAdapter::list_open_positions. Decimal fields (rust_decimal::Decimal) serialize as JSON strings, not numbers, to avoid floating-point precision loss on money values.",
+  "type": "object",
+  "required": [
+    "position_id", "trace_id", "signal_id", "pair", "direction", "legs",
+    "entry_price", "current_price", "unrealized_pnl", "realized_pnl",
+    "entry_time", "last_update", "status"
+  ],
+  "properties": {
+    "position_id": { "type": "string", "format": "uuid" },
+    "trace_id": { "type": "string", "format": "uuid", "description": "Correlates back to the signal that led to this position. Synthesized as a fresh id (not a real one) for a position DerivAdapter::list_open_positions discovers that this daemon didn't itself open in this process's memory, since Deriv's own API carries no equivalent field." },
+    "signal_id": { "type": "string", "format": "uuid" },
+    "pair": { "type": "string", "example": "EURUSD" },
+    "direction": { "type": "string", "enum": ["Buy", "Sell"] },
+    "legs": {
+      "type": "array",
+      "description": "Fill history. A Deriv Multiplier fills atomically, so this is always exactly one entry for a position this daemon opened.",
+      "items": {
+        "type": "object",
+        "required": ["price", "size", "filled_at"],
+        "properties": {
+          "price": { "type": "string", "description": "Decimal as string." },
+          "size": { "type": "string", "description": "Decimal as string. For this daemon's Multiplier contracts, size is the dollar stake, not a unit/lot count." },
+          "filled_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "entry_price": { "type": "string" },
+    "current_price": { "type": "string" },
+    "unrealized_pnl": { "type": "string" },
+    "realized_pnl": { "type": "string" },
+    "entry_time": { "type": "string", "format": "date-time" },
+    "last_update": { "type": "string", "format": "date-time" },
+    "status": {
+      "type": "string",
+      "description": "See domain::types::PositionStatus for the authoritative variant list; this document does not claim to enumerate every variant."
+    },
+    "exit_reason": {
+      "type": ["string", "null"],
+      "enum": ["StopLoss", "TakeProfit", "News", "Contradiction", null],
+      "description": "Set once the position closes; null while open."
+    },
+    "stop_loss": { "type": ["string", "null"], "description": "Decimal as string, or null if no stop is set." },
+    "take_profit": { "type": ["string", "null"] }
+  }
+}

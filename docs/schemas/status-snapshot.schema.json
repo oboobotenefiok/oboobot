@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StatusSnapshot",
+  "description": "daemon::operations::StatusSnapshot, written to status.json and overwritten in full on every invocation (not appended).",
+  "type": "object",
+  "required": ["open_position_count", "health_state", "paused"],
+  "properties": {
+    "last_run": { "type": ["string", "null"], "format": "date-time" },
+    "open_position_count": { "type": "integer", "minimum": 0 },
+    "health_state": {
+      "type": "string",
+      "description": "The daemon's SystemState at the moment this was written (e.g. Healthy, Degraded, ReadOnly, EmergencyShutdown). See daemon::health for the authoritative variant list and what allows/blocks new entries at each state."
+    },
+    "last_decision": {
+      "type": ["string", "null"],
+      "description": "A single free-text summary. With more than one configured pair-set, this is a semicolon-joined summary across all of them, e.g. \"EURUSD/GBPUSD: order_submitted; USDJPY/AUDUSD: no_divergence\": not a structured per-pair-set field, to avoid changing this schema for existing tooling that reads it."
+    },
+    "paused": { "type": "boolean", "description": "True if the PAUSED kill-switch file was present when this cycle ran." }
+  }
+}

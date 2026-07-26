@@ -29,7 +29,7 @@ use crate::adapter::{BrokerAdapter, BrokerCapabilities, BrokerError};
 
 fn not_implemented(broker: &str, method: &str) -> BrokerError {
     BrokerError::NotImplemented(format!(
-        "{broker}::{method} — wire protocol not yet implemented, use --broker mock for a working run"
+        "{broker}::{method}: wire protocol not yet implemented, use --broker mock for a working run"
     ))
 }
 
@@ -45,13 +45,15 @@ pub struct BybitAdapter {
 impl BybitAdapter {
     /// Reads `BYBIT_API_KEY` and `BYBIT_API_SECRET` from the environment.
     pub fn from_env() -> Result<Self, BrokerError> {
-        let api_key = std::env::var("BYBIT_API_KEY").map_err(|_| {
-            BrokerError::ConnectionFailed("BYBIT_API_KEY is not set".to_string())
-        })?;
+        let api_key = std::env::var("BYBIT_API_KEY")
+            .map_err(|_| BrokerError::ConnectionFailed("BYBIT_API_KEY is not set".to_string()))?;
         let api_secret = std::env::var("BYBIT_API_SECRET").map_err(|_| {
             BrokerError::ConnectionFailed("BYBIT_API_SECRET is not set".to_string())
         })?;
-        Ok(BybitAdapter { api_key, api_secret })
+        Ok(BybitAdapter {
+            api_key,
+            api_secret,
+        })
     }
 }
 
@@ -121,7 +123,10 @@ mod tests {
 
     #[tokio::test]
     async fn bybit_stub_returns_not_implemented_not_a_panic() {
-        let adapter = BybitAdapter { api_key: "test".to_string(), api_secret: "test".to_string() };
+        let adapter = BybitAdapter {
+            api_key: "test".to_string(),
+            api_secret: "test".to_string(),
+        };
         let result = adapter.get_snapshot(&["BTCUSDT".to_string()]).await;
         assert!(matches!(result, Err(BrokerError::NotImplemented(_))));
     }
