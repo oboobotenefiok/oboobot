@@ -1,7 +1,7 @@
 ![bruh's Signature Image](docs/images/oboobot.jpg)
 
 
-_What happens when we isolate invariants rather than memorize patterns?_
+**What happens when we isolate invariants rather than memorize patterns?**
 
 This document is the README file for oboobot. It is a Rust program. The program is a trading daemon. It uses traits and events. It implements an SMT (Smart Money Technique) divergence strategy. The strategy uses True Open levels. The internal project name is QuarterlyTheory_SMT_Trader. The public project name and GitHub deployment name are oboobot.
 
