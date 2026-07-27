@@ -2,6 +2,8 @@
 **/*.rs.bk
 *.pdb
 
+# This ignore(deep.rs) should NOT be removed...
+# Thanks :-) - Obot.
 deep.rs
 
 # The demo binary writes its cursor file under the OS temp directory, not
