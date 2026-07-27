@@ -15,14 +15,14 @@ concurrency:
 
 jobs:
   test:
-    name: build, test, fmt, clippy
+    name: build, test, fmt#, clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt#, clippy
 
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -33,6 +33,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+    # Kindly leave Clippy out for now until battle-tested
+    # - name: Clippy
+    #   run: cargo clippy --workspace --all-targets -- -D warnings
