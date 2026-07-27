@@ -28,7 +28,10 @@ where
     T: Serialize + DeserializeOwned + Send + Sync,
 {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        SnapshotFile { path: path.into(), _marker: PhantomData }
+        SnapshotFile {
+            path: path.into(),
+            _marker: PhantomData,
+        }
     }
 
     /// The current value, or `None` if this snapshot has never been
@@ -45,7 +48,8 @@ where
             return Ok(None);
         }
 
-        let value: T = serde_json::from_str(contents.trim()).map_err(|source| self.serde_err(source))?;
+        let value: T =
+            serde_json::from_str(contents.trim()).map_err(|source| self.serde_err(source))?;
         Ok(Some(value))
     }
 
@@ -59,21 +63,35 @@ where
         let json = serde_json::to_string(value).map_err(|source| self.serde_err(source))?;
 
         let tmp_path = self.path.with_extension("tmp");
-        let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|source| self.io_err(source))?;
-        file.write_all(json.as_bytes()).await.map_err(|source| self.io_err(source))?;
-        file.sync_all().await.map_err(|source| self.io_err(source))?;
+        let mut file = tokio::fs::File::create(&tmp_path)
+            .await
+            .map_err(|source| self.io_err(source))?;
+        file.write_all(json.as_bytes())
+            .await
+            .map_err(|source| self.io_err(source))?;
+        file.sync_all()
+            .await
+            .map_err(|source| self.io_err(source))?;
         drop(file);
 
-        tokio::fs::rename(&tmp_path, &self.path).await.map_err(|source| self.io_err(source))?;
+        tokio::fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|source| self.io_err(source))?;
         Ok(())
     }
 
     fn io_err(&self, source: std::io::Error) -> PersistenceError {
-        PersistenceError::Io { path: self.path.display().to_string(), source }
+        PersistenceError::Io {
+            path: self.path.display().to_string(),
+            source,
+        }
     }
 
     fn serde_err(&self, source: serde_json::Error) -> PersistenceError {
-        PersistenceError::Serde { path: self.path.display().to_string(), source }
+        PersistenceError::Serde {
+            path: self.path.display().to_string(),
+            source,
+        }
     }
 }
 

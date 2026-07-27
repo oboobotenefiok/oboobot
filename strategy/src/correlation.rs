@@ -7,7 +7,7 @@
 //! far enough from a baseline to be worth flagging.
 //!
 //! Correlation is a quality signal, not a money figure, so this uses
-//! `f64` throughout rather than `Decimal` — consistent with why
+//! `f64` throughout rather than `Decimal`, consistent with why
 //! `Coefficient` in `domain::newtypes` made the same choice.
 
 use rust_decimal::Decimal;

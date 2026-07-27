@@ -7,8 +7,8 @@
 //! review was: if the news source is unavailable, does the bot fail
 //! safe (assume news might be coming, act conservatively) or fail open
 //! (assume nothing's scheduled, trade normally)? `NoNewsProvider`
-//! answers that by construction — it always returns empty, meaning the
-//! pre-news exit check can never fire — which is honest about what "no
+//! answers that by construction: it always returns empty, meaning the
+//! pre-news exit check can never fire, which is honest about what "no
 //! real news integration yet" actually means, rather than quietly
 //! disabling a safety check while looking like it's still active. A
 //! real provider (calling out to an actual economic calendar) is a

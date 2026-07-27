@@ -100,7 +100,10 @@ impl MockBroker {
     }
 
     pub fn insert_position(&self, position: Position) {
-        self.state.lock().positions.insert(position.position_id, position);
+        self.state
+            .lock()
+            .positions
+            .insert(position.position_id, position);
     }
 
     pub fn how_many_calls(&self) -> u64 {
@@ -151,9 +154,9 @@ impl BrokerAdapter for MockBroker {
         };
 
         match scripted {
-            Some(ScriptedResponse::ConnectionFailed) => {
-                Err(BrokerError::ConnectionFailed("simulated connection failure".to_string()))
-            }
+            Some(ScriptedResponse::ConnectionFailed) => Err(BrokerError::ConnectionFailed(
+                "simulated connection failure".to_string(),
+            )),
             Some(ScriptedResponse::Timeout(ms)) => Err(BrokerError::Timeout(ms)),
             Some(ScriptedResponse::RateLimited(ms)) => Err(BrokerError::RateLimited(ms)),
             Some(ScriptedResponse::Rejected(reason)) => Err(BrokerError::Rejected(reason)),
@@ -161,7 +164,9 @@ impl BrokerAdapter for MockBroker {
                 Err(BrokerError::MalformedResponse(detail))
             }
             Some(ScriptedResponse::PartialFill(filled_size)) => {
-                let fill_price = request.price.unwrap_or_else(|| self.state.lock().synthetic_price);
+                let fill_price = request
+                    .price
+                    .unwrap_or_else(|| self.state.lock().synthetic_price);
                 let order = Order {
                     order_id: request.order_id,
                     trace_id: request.trace_id,
@@ -176,14 +181,19 @@ impl BrokerAdapter for MockBroker {
                     timestamp: Utc::now(),
                     last_update: Utc::now(),
                 };
-                self.state.lock().orders.insert(order.order_id, order.clone());
+                self.state
+                    .lock()
+                    .orders
+                    .insert(order.order_id, order.clone());
                 Ok(order)
             }
             None => {
                 // Normal path: fill completely at the requested price (or
                 // the synthetic market price for a Market order that
                 // didn't specify one).
-                let fill_price = request.price.unwrap_or_else(|| self.state.lock().synthetic_price);
+                let fill_price = request
+                    .price
+                    .unwrap_or_else(|| self.state.lock().synthetic_price);
                 let position_id = Uuid::new_v4();
                 let order = Order {
                     order_id: request.order_id,
@@ -199,7 +209,10 @@ impl BrokerAdapter for MockBroker {
                     timestamp: Utc::now(),
                     last_update: Utc::now(),
                 };
-                self.state.lock().orders.insert(order.order_id, order.clone());
+                self.state
+                    .lock()
+                    .orders
+                    .insert(order.order_id, order.clone());
 
                 let position = Position {
                     position_id,
@@ -223,7 +236,10 @@ impl BrokerAdapter for MockBroker {
                     stop_loss: request.stop_loss,
                     take_profit: request.take_profit,
                 };
-                self.state.lock().positions.insert(position.position_id, position);
+                self.state
+                    .lock()
+                    .positions
+                    .insert(position.position_id, position);
 
                 Ok(order)
             }
@@ -253,7 +269,9 @@ impl BrokerAdapter for MockBroker {
             domain::Direction::Buy => Decimal::ONE,
             domain::Direction::Sell => -Decimal::ONE,
         };
-        let realized_pnl = (close_price - position.entry_price) * position.legs.iter().map(|l| l.size).sum::<Decimal>() * direction_multiplier;
+        let realized_pnl = (close_price - position.entry_price)
+            * position.legs.iter().map(|l| l.size).sum::<Decimal>()
+            * direction_multiplier;
 
         let order = Order {
             order_id: Uuid::new_v4(),
@@ -400,7 +418,9 @@ mod tests {
     async fn close_position_removes_it_and_returns_a_closing_order() {
         let broker = MockBroker::new(Usd::from_decimal(dec!(10000)), dec!(1.1000));
         let order = broker.submit_order(sample_request()).await.unwrap();
-        let position_id = order.position_id.expect("normal fill path always sets position_id");
+        let position_id = order
+            .position_id
+            .expect("normal fill path always sets position_id");
 
         let closing_order = broker.close_position(position_id).await.unwrap();
         assert_eq!(closing_order.status, OrderStatus::Filled);

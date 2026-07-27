@@ -159,8 +159,9 @@ impl HolidayProvider for StaticHolidayProvider {
 /// dates rather than a 0-indexed offset.
 fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, n: u32) -> Option<NaiveDate> {
     let first_of_month = NaiveDate::from_ymd_opt(year, month, 1)?;
-    let first_weekday_offset =
-        (7 + weekday.num_days_from_sunday() as i64 - first_of_month.weekday().num_days_from_sunday() as i64) % 7;
+    let first_weekday_offset = (7 + weekday.num_days_from_sunday() as i64
+        - first_of_month.weekday().num_days_from_sunday() as i64)
+        % 7;
     let first_occurrence = first_of_month + Duration::days(first_weekday_offset);
     Some(first_occurrence + Duration::weeks((n - 1) as i64))
 }
@@ -227,7 +228,8 @@ pub fn week_start_for(reference: DateTime<Tz>) -> DateTime<Tz> {
 pub fn is_full_trading_week(this_week_start: DateTime<Tz>, holidays: &dyn HolidayProvider) -> bool {
     let previous_week_start = this_week_start - Duration::weeks(1);
 
-    let seven_days_apart = (this_week_start.date_naive() - previous_week_start.date_naive()).num_days() == 7;
+    let seven_days_apart =
+        (this_week_start.date_naive() - previous_week_start.date_naive()).num_days() == 7;
 
     // Even if the calendar math lines up, a week whose open falls on a
     // known holiday shouldn't be treated as "full" either.
@@ -322,7 +324,10 @@ mod tests {
     fn week_start_for_lands_on_sunday_at_1800_ny() {
         // Pick a Wednesday and check it resolves back to that week's
         // Sunday open.
-        let wednesday = ny_tz().with_ymd_and_hms(2026, 3, 4, 9, 0, 0).single().unwrap();
+        let wednesday = ny_tz()
+            .with_ymd_and_hms(2026, 3, 4, 9, 0, 0)
+            .single()
+            .unwrap();
         let start = week_start_for(wednesday);
         assert_eq!(start.weekday(), Weekday::Sun);
         assert_eq!(start.hour(), 18);

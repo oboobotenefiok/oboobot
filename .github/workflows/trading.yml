@@ -65,9 +65,15 @@ jobs:
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             FORCE_FLAG="--force"
           fi
-          # --broker mock until a real adapter is wired in: see the
-          # workspace README for status. Swap this to --broker deriv
-          # (or bybit) once one is ready to trade for real.
+          # --broker mock: DerivAdapter itself is substantially built
+          # (order submission, position listing, historical backfill,
+          # retry logic) but switching this to --broker deriv is a real
+          # trading-with-real-money decision, not a code readiness one.
+          # Before flipping this: DERIV_APP_ID and DERIV_API_TOKEN need
+          # to be genuinely configured as repo secrets (currently just
+          # referenced below, not set), and see the workspace README's
+          # "Remaining Gaps" for what's still not covered even once they
+          # are.
           cargo run --release --bin oboobot -- \
             --broker mock \
             --state-dir ../oboobot_report/state \

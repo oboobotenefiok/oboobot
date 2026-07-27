@@ -25,15 +25,14 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
-# We have to ignore this to evade failing for now.
-#     - name: Check formatting
-#        run: cargo fmt --all -- --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Build workspace
         run: cargo build --workspace --all-targets
 
       - name: Run tests
         run: cargo test --workspace
-# Comment this out to evade errors for now.
-#      - name: Clippy
-#        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

@@ -52,8 +52,7 @@ where
     /// length (the new cursor position), only after the write has been
     /// fsync'd. See the module docs for why the fsync isn't optional.
     pub async fn append(&self, record: &T) -> Result<u64, PersistenceError> {
-        let mut line =
-            serde_json::to_string(record).map_err(|source| self.serde_err(source))?;
+        let mut line = serde_json::to_string(record).map_err(|source| self.serde_err(source))?;
         line.push('\n');
 
         let mut file = tokio::fs::OpenOptions::new()
@@ -71,9 +70,14 @@ where
         // above this line could, in principle, still be sitting in a
         // buffer somewhere; after this line returns `Ok`, the record is
         // actually on disk.
-        file.sync_all().await.map_err(|source| self.io_err(source))?;
+        file.sync_all()
+            .await
+            .map_err(|source| self.io_err(source))?;
 
-        let metadata = file.metadata().await.map_err(|source| self.io_err(source))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|source| self.io_err(source))?;
         Ok(metadata.len())
     }
 
@@ -87,7 +91,11 @@ where
     /// daemon resumes from a previously saved cursor instead of
     /// re-reading its entire history on every restart.
     pub async fn read_from(&self, offset: u64) -> Result<Vec<T>, PersistenceError> {
-        let file = match tokio::fs::OpenOptions::new().read(true).open(&self.path).await {
+        let file = match tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .await
+        {
             Ok(file) => file,
             // A cursor file that hasn't been created yet just means
             // "nothing's been recorded so far," not an error condition.
@@ -169,11 +177,17 @@ mod tests {
         let cursor = CursorFile::<SampleRecord>::new(&path);
 
         cursor
-            .append(&SampleRecord { id: 1, label: "first".to_string() })
+            .append(&SampleRecord {
+                id: 1,
+                label: "first".to_string(),
+            })
             .await
             .unwrap();
         cursor
-            .append(&SampleRecord { id: 2, label: "second".to_string() })
+            .append(&SampleRecord {
+                id: 2,
+                label: "second".to_string(),
+            })
             .await
             .unwrap();
 
@@ -190,12 +204,18 @@ mod tests {
         let cursor = CursorFile::<SampleRecord>::new(&path);
 
         cursor
-            .append(&SampleRecord { id: 1, label: "first".to_string() })
+            .append(&SampleRecord {
+                id: 1,
+                label: "first".to_string(),
+            })
             .await
             .unwrap();
         let offset_after_first = cursor.current_offset().await.unwrap();
         cursor
-            .append(&SampleRecord { id: 2, label: "second".to_string() })
+            .append(&SampleRecord {
+                id: 2,
+                label: "second".to_string(),
+            })
             .await
             .unwrap();
 
@@ -222,14 +242,20 @@ mod tests {
 
         assert_eq!(cursor.current_offset().await.unwrap(), 0);
         cursor
-            .append(&SampleRecord { id: 1, label: "first".to_string() })
+            .append(&SampleRecord {
+                id: 1,
+                label: "first".to_string(),
+            })
             .await
             .unwrap();
         let after_one = cursor.current_offset().await.unwrap();
         assert!(after_one > 0);
 
         cursor
-            .append(&SampleRecord { id: 2, label: "second".to_string() })
+            .append(&SampleRecord {
+                id: 2,
+                label: "second".to_string(),
+            })
             .await
             .unwrap();
         let after_two = cursor.current_offset().await.unwrap();

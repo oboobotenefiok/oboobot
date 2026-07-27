@@ -1,7 +1,5 @@
 ![bruh's Signature Image](docs/images/oboobot.jpg)
 
-**What happens when we isolate invariants rather than memorize patterns?**
-
 This document is the README file for oboobot. It is a Rust program. The program is a trading daemon. It uses traits and events. It implements an SMT (Smart Money Technique) divergence strategy. The strategy uses True Open levels. The internal project name is QuarterlyTheory_SMT_Trader. The public project name and GitHub deployment name are oboobot.
 
 > ## Risk Warning
@@ -62,7 +60,8 @@ The system stores files in the state directory (--state-dir):
 - true_open_weekly.json  
 - true_open_daily.json  
 - status.json (overwritten each run)  
-- PAUSED (kill switch)
+- PAUSED (kill switch)  
+- replay/ (only created by `--replay-days`; a self-contained copy of the above, isolated from real state, wiped clean at the start of every replay run)
 
 ## How to Run
 Demo mode:  

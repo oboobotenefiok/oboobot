@@ -110,7 +110,9 @@ mod tests {
             .unwrap()
             .and_hms_opt(9, 0, 0)
             .unwrap();
-        let ny_dt = crate::calendar::ny_tz().from_local_datetime(&ny_naive).unwrap();
+        let ny_dt = crate::calendar::ny_tz()
+            .from_local_datetime(&ny_naive)
+            .unwrap();
         let utc_dt = ny_dt.with_timezone(&chrono::Utc);
         assert!(is_within_macro_cycle(utc_dt));
     }
@@ -121,7 +123,9 @@ mod tests {
             .unwrap()
             .and_hms_opt(10, 30, 0)
             .unwrap();
-        let ny_dt = crate::calendar::ny_tz().from_local_datetime(&ny_naive).unwrap();
+        let ny_dt = crate::calendar::ny_tz()
+            .from_local_datetime(&ny_naive)
+            .unwrap();
         let utc_dt = ny_dt.with_timezone(&chrono::Utc);
         assert!(!is_within_macro_cycle(utc_dt));
     }
@@ -134,7 +138,9 @@ mod tests {
             .unwrap()
             .and_hms_opt(23, 55, 0)
             .unwrap();
-        let ny_dt = crate::calendar::ny_tz().from_local_datetime(&ny_naive).unwrap();
+        let ny_dt = crate::calendar::ny_tz()
+            .from_local_datetime(&ny_naive)
+            .unwrap();
         let utc_dt = ny_dt.with_timezone(&chrono::Utc);
         assert!(is_within_macro_cycle(utc_dt));
     }
@@ -145,7 +151,9 @@ mod tests {
             .unwrap()
             .and_hms_opt(9, 30, 0)
             .unwrap();
-        let ny_dt = crate::calendar::ny_tz().from_local_datetime(&ny_naive).unwrap();
+        let ny_dt = crate::calendar::ny_tz()
+            .from_local_datetime(&ny_naive)
+            .unwrap();
         let utc_dt = ny_dt.with_timezone(&chrono::Utc);
 
         let next = next_macro_cycle_after(utc_dt);

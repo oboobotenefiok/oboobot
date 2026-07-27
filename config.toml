@@ -1,5 +1,5 @@
 # oboobot configuration. Copy this to config.toml (or point --config at
-# your own copy) and adjust. None of this is secret — API keys and
+# your own copy) and adjust. None of this is secret: API keys and
 # webhook URLs are read from environment variables named here, never
 # written directly into this file, since this file is meant to live in
 # an open-source repo.
@@ -22,6 +22,25 @@ spread_multiplier = 1.5
 # before it's flagged as a regime shift. A fraction, not a percentage
 # (0.20 means 20 percentage points of coefficient, e.g. 0.90 -> 0.70).
 regime_shift_threshold = 0.20
+# Cap on net exposure (existing open positions plus a candidate signal,
+# in risk-dollar terms) to any single currency.
+max_exposure_per_currency_percent = 15.0
+# Cap on exposure to a pair whose live correlation with a candidate
+# signal's pair is at or above correlation_exposure_threshold.
+max_correlation_exposure_percent = 10.0
+# How strong a live |correlation coefficient| has to be before two
+# pairs count as the same cluster for max_correlation_exposure_percent.
+# A separate number from regime_shift_threshold on purpose: that one
+# measures how much correlation has moved from baseline, this one
+# measures how strong it currently is.
+correlation_exposure_threshold = 0.7
+# Freshness thresholds for the health checks: how old correlation data,
+# spread history, and the broker snapshot itself are allowed to get
+# before being flagged as stale/degraded. All three default to a
+# healthy margin above the 5-minute invocation cadence.
+correlation_staleness_minutes = 30
+spread_staleness_minutes = 30
+snapshot_latency_threshold_seconds = 120
 
 # One entry per correlated pair this strategy watches. Add another pair
 # by adding another [[pairs]] block below, nothing else changes.

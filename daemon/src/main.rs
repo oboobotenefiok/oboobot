@@ -1,4 +1,4 @@
-//! `oboobot` — real entry point for the QuarterlyTheory_SMT_Trader daemon.
+//! `oboobot`: real entry point for the QuarterlyTheory_SMT_Trader daemon.
 //!
 //! Two distinct modes live in this file:
 //!
@@ -62,7 +62,7 @@ struct Cli {
     #[arg(long, default_value = "./state")]
     state_dir: PathBuf,
 
-    /// Path to the TOML config file. Missing is fine — falls back to
+    /// Path to the TOML config file. Missing is fine, falls back to
     /// Config::default_config.
     #[arg(long, default_value = "./config.toml")]
     config: PathBuf,
@@ -664,24 +664,26 @@ async fn run_real_cycle(
     // Net exposure per currency across every currently open position,
     // regardless of which pair-set it came from: this is what the
     // currency-exposure risk check compares each candidate signal
-    // against. Built once here rather than per pair-set, since it's the
-    // same account-wide picture no matter which pair-set is being
-    // evaluated.
-    let mut currency_exposure: BTreeMap<String, Decimal> = BTreeMap::new();
-    for position in &open_positions {
-        if let Some((base, quote)) = risk::currency_pair(&position.pair) {
-            let size: Decimal = position.legs.iter().map(|leg| leg.size).sum();
-            let (base_direction, quote_direction) = match position.direction {
-                Direction::Buy => (Decimal::ONE, -Decimal::ONE),
-                Direction::Sell => (-Decimal::ONE, Decimal::ONE),
-            };
-            *currency_exposure
-                .entry(base.to_string())
-                .or_insert(Decimal::ZERO) += base_direction * size;
-            *currency_exposure
-                .entry(quote.to_string())
-                .or_insert(Decimal::ZERO) += quote_direction * size;
+    // against. Computed fresh inside the loop below, per pair-set, not
+    // once here: an earlier pair-set in this same cycle can open a new
+    // position, and a later pair-set's own exposure check needs to see
+    // it, the same reason correlated_exposure is already computed
+    // fresh per pair-set rather than once up front.
+    fn currency_exposure_snapshot(positions: &[Position]) -> BTreeMap<String, Decimal> {
+        let mut exposure = BTreeMap::new();
+        for position in positions {
+            if let Some((base, quote)) = risk::currency_pair(&position.pair) {
+                let size: Decimal = position.legs.iter().map(|leg| leg.size).sum();
+                let (base_direction, quote_direction) = match position.direction {
+                    Direction::Buy => (Decimal::ONE, -Decimal::ONE),
+                    Direction::Sell => (-Decimal::ONE, Decimal::ONE),
+                };
+                *exposure.entry(base.to_string()).or_insert(Decimal::ZERO) += base_direction * size;
+                *exposure.entry(quote.to_string()).or_insert(Decimal::ZERO) +=
+                    quote_direction * size;
+            }
         }
+        exposure
     }
 
     // One pass per configured pair-set: each gets its own spread filter,
@@ -881,7 +883,7 @@ async fn run_real_cycle(
                     take_profit_price,
                     realized_pnl_today: Usd::zero(),
                     realized_pnl_this_week: Usd::zero(),
-                    currency_exposure: currency_exposure.clone(),
+                    currency_exposure: currency_exposure_snapshot(&open_positions),
                     correlated_exposure,
                 };
 

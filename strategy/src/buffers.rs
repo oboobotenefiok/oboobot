@@ -1,6 +1,6 @@
 //! The daily and session buffers SMT divergence is measured against
 //! were, until now, a fixed offset around whatever the live price
-//! happened to be at the moment `main.rs` ran — always centered, so
+//! happened to be at the moment `main.rs` ran, always centered, so
 //! `detect_divergence` could never actually fire. This file is what
 //! replaces that: a real running high and low, updated with whatever
 //! price this invocation observed, persisted between invocations, and

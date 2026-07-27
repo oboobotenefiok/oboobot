@@ -20,12 +20,16 @@ pub const DAILY_CAPTURE_HOUR_NY: u32 = 0;
 pub const WEEKLY_CAPTURE_HOUR_NY: u32 = 18;
 
 /// The next instant, at or after `after`, that lands on `hour:00 NY`
-/// local time — and, if `weekday` is given, that also falls on that
+/// local time and, if `weekday` is given, that also falls on that
 /// weekday. General enough to answer "next midnight NY," "next Monday
 /// 18:00 NY," or "next 06:00 NY session boundary" with the same logic,
 /// which is why it's public rather than private to this file: the
 /// buffer-reset logic in `strategy` needs the same search.
-pub fn next_ny_occurrence(after: DateTime<Utc>, hour: u32, weekday: Option<Weekday>) -> DateTime<Utc> {
+pub fn next_ny_occurrence(
+    after: DateTime<Utc>,
+    hour: u32,
+    weekday: Option<Weekday>,
+) -> DateTime<Utc> {
     let ny_now = to_ny(after);
     let mut candidate_date = ny_now.date_naive();
 
@@ -69,7 +73,7 @@ pub fn needs_capture(now: DateTime<Utc>, current: Option<&TrueOpenLevel>) -> boo
 /// Build a fresh level for `timeframe`, capturing `price` as of `now`.
 /// For Weekly, returns `None` instead of a level when the current week
 /// doesn't qualify for one (a partial week per
-/// [`crate::calendar::is_full_trading_week`]) — callers should treat a
+/// [`crate::calendar::is_full_trading_week`]); callers should treat a
 /// `None` weekly level as `Bias::Neutral` for the whole week, which is
 /// exactly what handing the decision to Daily was always meant to mean.
 pub fn capture_level(
@@ -153,7 +157,8 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let holidays = StaticHolidayProvider;
-        let level = capture_level(Timeframe::Daily, "EURUSD", dec!(1.1000), noon_ny, &holidays).unwrap();
+        let level =
+            capture_level(Timeframe::Daily, "EURUSD", dec!(1.1000), noon_ny, &holidays).unwrap();
         let expires_ny = to_ny(level.expires_at);
         assert_eq!(expires_ny.hour(), 0);
         // Expiry should be later the same NY calendar day (midnight
@@ -169,7 +174,14 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let holidays = StaticHolidayProvider;
-        let level = capture_level(Timeframe::Weekly, "EURUSD", dec!(1.1000), tuesday_ny, &holidays).unwrap();
+        let level = capture_level(
+            Timeframe::Weekly,
+            "EURUSD",
+            dec!(1.1000),
+            tuesday_ny,
+            &holidays,
+        )
+        .unwrap();
         let expires_ny = to_ny(level.expires_at);
         assert_eq!(expires_ny.weekday(), Weekday::Mon);
         assert_eq!(expires_ny.hour(), 18);
@@ -182,7 +194,13 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let holidays = StaticHolidayProvider;
-        let level = capture_level(Timeframe::Weekly, "EURUSD", dec!(1.1000), tuesday_ny, &holidays);
+        let level = capture_level(
+            Timeframe::Weekly,
+            "EURUSD",
+            dec!(1.1000),
+            tuesday_ny,
+            &holidays,
+        );
         assert!(level.is_some());
     }
 }

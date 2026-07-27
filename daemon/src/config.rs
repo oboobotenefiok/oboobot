@@ -139,7 +139,7 @@ pub struct Config {
 
 impl Config {
     /// A sensible built-in default so the daemon still runs without a
-    /// config file present — useful for `--demo` and for a first-ever
+    /// config file present, useful for `--demo` and for a first-ever
     /// run before anyone's authored a config.toml.
     pub fn default_config() -> Self {
         Config {
